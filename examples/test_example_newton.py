@@ -12,11 +12,10 @@
 #
 ###########################################################################
 
-import warp as wp
-
 import newton
 import newton.examples
 import newton.viewer
+import warp as wp
 
 
 class Example:
@@ -64,7 +63,7 @@ class Example:
                 k_damp=k_damp,
                 fix_left=True,
             )
-        
+
 
         builder.color()
 
@@ -185,7 +184,7 @@ def save_frame(args):
     viewer.close()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     parser = Example.create_parser()
     args, _ = parser.parse_known_args()
     if args.save_frame:
