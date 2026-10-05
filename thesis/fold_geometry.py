@@ -82,7 +82,7 @@ class Board:
     seam: float = 0.0015
     table_top: float = 0.60
     center_xy: tuple = (0.48, 0.0)
-    handle_extension: float = 0.045
+    handle_extension: float = 0.015
     handle_radius: float = 0.009
 
     def __post_init__(self):
