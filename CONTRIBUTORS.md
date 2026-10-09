@@ -52,12 +52,14 @@ Guidelines for modifications:
 * Alessandro Assirelli
 * Alex Omar
 * Alexander Millane
+* Alexander Temirov
 * Alice Zhou
 * alltheseas
 * Amr Mousa
 * Andrei Aristarkhov
 * Andrej Orsula
 * Anke Zhao
+* Anthony Clark
 * Anton Bjørndahl Mortensen
 * Antonin Raffin
 * Arjun Bhardwaj
@@ -229,6 +231,7 @@ Guidelines for modifications:
 * Yuguo Shan
 * Yujian Zhang
 * Yun Liu
+* Yusuf Guenena
 * YuTeh Shen
 * Zehao Wang
 * Zeng Qingcheng
