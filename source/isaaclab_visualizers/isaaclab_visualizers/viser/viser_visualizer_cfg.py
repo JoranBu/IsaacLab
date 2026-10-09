@@ -35,6 +35,7 @@ class ViserVisualizerCfg(VisualizerCfg):
     """Renderer configuration for the auto-created streaming camera."""
 
     port: int = 8080
+    port: int = 8081
     """Port of the local viser web server."""
 
     bind_address: str = "0.0.0.0"
