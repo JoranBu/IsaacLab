@@ -5,7 +5,7 @@
 
 # Adapted from isaac-sim/IsaacLabTutorial (Apache-2.0); see ../LICENSE-IsaacLabTutorial.
 
-"""Observations, rewards, milestones, and terminations for the vial-placement task."""
+"""Observations, rewards, milestones, and terminations for grasping and lifting a vial."""
 
 from __future__ import annotations
 
@@ -17,14 +17,8 @@ import torch
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg, TerminationTermCfg
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, subtract_frame_transforms
 
-from .geometry import (
-    cylinder_lowest_offset,
-    inside_bounds,
-    rack_local_position,
-    symmetric_axial_keypoint_error,
-    vertical_alignment,
-)
-from .progress import PlacementProgress
+from .geometry import cylinder_lowest_offset
+from .progress import LiftProgress
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, RigidObject
@@ -33,23 +27,12 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Task geometry (metres). All rack quantities are expressed in the rack frame, whose origin is the target opening.
+# Task geometry (metres). Heights are measured above each environment's origin.
 # ---------------------------------------------------------------------------------------------------------------------
 
 # The mat is centred at 32 mm and is 6 mm thick; the horizontal vial has a 17 mm collision radius.
-VIAL_REST_HEIGHT = 0.052
-# A released vial seats at about 31 mm; the success box accepts the seated pose, not a vial resting on the rim.
-RACK_LOWER = (-0.015, -0.015, 0.026)
-RACK_UPPER = (0.015, 0.015, 0.040)
-# Held insertion ends with the vial root near 60 mm so the jaws stay clear of the rack; gravity finishes the travel.
-HELD_INSERTION_TARGET = (0.0, 0.0, 0.060)
-RACK_RIM_HEIGHT = 0.073
-RACK_CLEARANCE_HEIGHT = RACK_RIM_HEIGHT + 0.008
-# The 48 mm opening leaves the 34 mm vial about 7 mm of play per axis. A tip below the rim within this radius is in
-# the target opening; the neighbouring openings are 60 mm away.
-INSERTION_RADIUS = 0.012
-# Cosine of the vial axis with vertical; 0.9 is about 26 degrees of tilt.
-UPRIGHT_ALIGNMENT = 0.90
+MAT_TOP_HEIGHT = 0.035
+LIFT_TARGET_CLEARANCE = 0.10
 VIAL_AXIS_MIN = -0.017
 VIAL_AXIS_MAX = 0.100
 VIAL_RADIUS = 0.017
@@ -57,10 +40,8 @@ VIAL_RADIUS = 0.017
 VIAL_GRASP_OFFSET = (0.0, 0.0, 0.092)
 # Both jaws touching a vial that is held this far above its resting height is a load-bearing grasp.
 GRASP_PROOF_LIFT = 0.006
-# Light rack guidance is expected during a real insertion; only much larger forces are counted as impacts.
-HARD_RACK_IMPACT_FORCE = 20.0
-FIXED_FINGERTIP_OFFSET = (-0.01289, -0.00022, -0.0986)
-MOVING_FINGERTIP_OFFSET = (-0.0068, -0.0766, 0.0189)
+FIXED_FINGERTIP_OFFSET = (0.0, 0.0, 0.046)
+MOVING_FINGERTIP_OFFSET = (0.0, 0.0, 0.046)
 
 
 def _finite(value: torch.Tensor) -> torch.Tensor:
@@ -96,41 +77,27 @@ def bilateral_contact(env: ManagerBasedRLEnv) -> torch.Tensor:
     return _contact(env, "fixed_jaw_contact") & _contact(env, "moving_jaw_contact")
 
 
-def hard_rack_impact(force: torch.Tensor, threshold: float = HARD_RACK_IMPACT_FORCE) -> torch.Tensor:
-    """Classify only contact forces large enough to be a physical impact."""
-    return force > threshold
-
-
-def unsafe_rack_contact(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Report hard vial/rack impacts while permitting ordinary guidance."""
-    return hard_rack_impact(_contact_magnitude(env, "vial_rack_contact"))
-
-
 def vial_height(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return the vial root height above its environment origin [m]."""
     vial: RigidObject = env.scene["vial"]
     return vial.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
 
 
-def vial_lowest_height_in_rack(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the vial's lowest physical point in rack-local Z [m]."""
+def vial_clearance(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the lowest physical point of the vial above the mat [m], accounting for orientation."""
     vial: RigidObject = env.scene["vial"]
-    rack: RigidObject = env.scene["rack"]
-    vial_pos = vial.data.root_pos_w.torch
-    vial_quat = vial.data.root_quat_w.torch
-    rack_pos = rack.data.root_pos_w.torch
-    rack_quat = rack.data.root_quat_w.torch
-    root_r = rack_local_position(vial_pos, rack_pos, rack_quat)
-    local_axis = vial_pos.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_pos)
-    axis_r = quat_apply_inverse(rack_quat, quat_apply(vial_quat, local_axis))
-    return root_r[:, 2] + cylinder_lowest_offset(axis_r[:, 2], VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS)
+    quaternion = vial.data.root_quat_w.torch
+    axis = quaternion.new_tensor((0.0, 0.0, 1.0)).expand(env.num_envs, -1)
+    axis_z = quat_apply(quaternion, axis)[:, 2]
+    lowest_offset = cylinder_lowest_offset(axis_z, VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS)
+    return vial_height(env) + lowest_offset - MAT_TOP_HEIGHT
 
 
 def fingertip_positions_w(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
     """Return both simplified contact-pad centres in world coordinates [m]."""
     robot: Articulation = env.scene["robot"]
-    fixed_id = robot.find_bodies("gripper", preserve_order=True)[0]
-    moving_id = robot.find_bodies("moving_jaw_so101_v1", preserve_order=True)[0]
+    fixed_id = robot.find_bodies("panda_leftfinger", preserve_order=True)[0]
+    moving_id = robot.find_bodies("panda_rightfinger", preserve_order=True)[0]
     fixed_pos = robot.data.body_pos_w.torch[:, fixed_id].squeeze(1)
     fixed_quat = robot.data.body_quat_w.torch[:, fixed_id].squeeze(1)
     moving_pos = robot.data.body_pos_w.torch[:, moving_id].squeeze(1)
@@ -158,39 +125,10 @@ def vial_grasp_point_w(env: ManagerBasedRLEnv) -> torch.Tensor:
 def _gripper_openness(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return normalized measured jaw opening in [0, 1]."""
     robot: Articulation = env.scene["robot"]
-    gripper_id = robot.find_joints("gripper", preserve_order=True)[0]
+    gripper_id = robot.find_joints("panda_finger_joint1", preserve_order=True)[0]
     position = robot.data.joint_pos.torch[:, gripper_id].squeeze(1)
     limits = robot.data.soft_joint_pos_limits.torch[:, gripper_id].squeeze(1)
     return _finite(((position - limits[:, 0]) / (limits[:, 1] - limits[:, 0])).clamp(0.0, 1.0))
-
-
-def _placement_values(env: ManagerBasedRLEnv):
-    """Return rack-local pose quality and physical release state."""
-    vial: RigidObject = env.scene["vial"]
-    rack: RigidObject = env.scene["rack"]
-    vial_pos = vial.data.root_pos_w.torch
-    vial_quat = vial.data.root_quat_w.torch
-    local = rack_local_position(vial_pos, rack.data.root_pos_w.torch, rack.data.root_quat_w.torch)
-    local = torch.nan_to_num(local, nan=1.0e3, posinf=1.0e3, neginf=-1.0e3)
-    alignment = _finite(vertical_alignment(vial_quat))
-    linear_speed = _finite_error(torch.linalg.vector_norm(vial.data.root_lin_vel_w.torch, dim=-1))
-    angular_speed = _finite_error(torch.linalg.vector_norm(vial.data.root_ang_vel_w.torch, dim=-1))
-    touching = _contact(env, "fixed_jaw_contact") | _contact(env, "moving_jaw_contact")
-    released = ~touching & (_gripper_openness(env) > 0.20)
-    placed = inside_bounds(local, RACK_LOWER, RACK_UPPER)
-    return local, alignment, linear_speed, angular_speed, released, placed
-
-
-def vial_inserted(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Whether the vial's tip is inside the target rack opening with the vial upright.
-
-    The uprightness condition (the same one success uses) matters for the teacher's release: without it the state
-    policy learns to let a tilted vial drop in from above, which works with perfect state but is a knife edge for a
-    camera student to imitate.
-    """
-    local, alignment, *_ = _placement_values(env)
-    centred = torch.linalg.vector_norm(local[:, :2], dim=-1) < INSERTION_RADIUS
-    return centred & (vial_lowest_height_in_rack(env) < RACK_RIM_HEIGHT) & (alignment > UPRIGHT_ALIGNMENT)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -198,67 +136,45 @@ def vial_inserted(env: ManagerBasedRLEnv) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _history(env: ManagerBasedRLEnv) -> PlacementProgress:
+def _history(env: ManagerBasedRLEnv) -> LiftProgress:
     """Return the instance-owned episode progress buffer."""
-    progress = getattr(env, "_so101_placement_progress", None)
+    progress = getattr(env, "_vial_lift_progress", None)
     if progress is None:
-        progress = PlacementProgress(env.num_envs, env.device, stable_steps=10, grasp_steps=2)
-        env._so101_placement_progress = progress
+        progress = LiftProgress(env.num_envs, env.device, stable_steps=10, grasp_steps=2)
+        env._vial_lift_progress = progress
     return progress
 
 
-class PlacementHistoryTerm(ManagerTermBase):
-    """Latch physical milestones each step and terminate on confirmed placement success.
+class LiftHistoryTerm(ManagerTermBase):
+    """Latch physical milestones each step and terminate on a sustained lift.
 
-    Success requires the released vial to rest upright inside the target opening for ten consecutive control steps.
-    Milestones seeded by downstream resets are restored on reset so they are never rewarded merely for being loaded.
+    Success requires both fingers to hold the vial with its lowest point at least 10 cm above the mat for ten
+    consecutive control steps. Orientation is unrestricted.
     """
 
     def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         self.progress = _history(env)
-        self._max_rack_force = torch.zeros(self.num_envs, device=self.device)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self.progress.reset(env_ids)
-        ids = slice(None) if env_ids is None else env_ids
-        self._max_rack_force[ids] = 0.0
-        grasped = getattr(self._env, "_so101_reset_grasped", None)
-        lifted = getattr(self._env, "_so101_reset_lifted", None)
-        if grasped is not None:
-            self.progress.grasped[ids] = grasped[ids]
-            self.progress.grasp_count[ids] = torch.where(grasped[ids], self.progress.grasp_steps, 0)
-        if lifted is not None:
-            self.progress.lifted[ids] = lifted[ids]
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
-        local, alignment, speed, angular_speed, released, placed = _placement_values(env)
-        holding = bilateral_contact(env) & (vial_height(env) > VIAL_REST_HEIGHT + GRASP_PROOF_LIFT)
-        cleared = vial_lowest_height_in_rack(env) >= RACK_CLEARANCE_HEIGHT
-        inserted = vial_inserted(env)
-        seated = placed & (alignment > UPRIGHT_ALIGNMENT) & released & (speed < 0.06) & (angular_speed < 0.8)
-        rack_force = _contact_magnitude(env, "vial_rack_contact")
-        self._max_rack_force.copy_(torch.maximum(self._max_rack_force, rack_force))
-        self.progress.unsafe_rack_contact |= hard_rack_impact(rack_force)
-        success = self.progress.update(holding, cleared, inserted, seated, env.episode_length_buf)
+        clearance = vial_clearance(env)
+        holding = bilateral_contact(env) & (clearance > GRASP_PROOF_LIFT)
+        above_target = clearance >= LIFT_TARGET_CLEARANCE
+        success = self.progress.update(holding, above_target, env.episode_length_buf)
 
         log = env.extras.setdefault("log", {})
         log["Metrics/grasp_rate"] = self.progress.grasped.float().mean()
         log["Metrics/lift_rate"] = self.progress.lifted.float().mean()
-        log["Metrics/insertion_rate"] = self.progress.inserted.float().mean()
-        log["Metrics/seated_rate"] = placed.float().mean()
         log["Metrics/success_rate"] = success.float().mean()
-        log["Safety/unsafe_rack_contact_rate"] = self.progress.unsafe_rack_contact.float().mean()
         log["Diagnostics/vial_height_m"] = _finite(vial_height(env)).mean()
-        log["Diagnostics/vertical_alignment"] = alignment.mean()
         log["Diagnostics/gripper_openness"] = _gripper_openness(env).mean()
-        log["Diagnostics/rack_local_z_m"] = _finite(local[:, 2]).mean()
+        log["Diagnostics/vial_clearance_m"] = _finite(clearance).mean()
         completed = self.progress.time_to_success >= 0
         if completed.any():
             log["Metrics/time_to_success_s"] = self.progress.time_to_success[completed].float().mean() * env.step_dt
-        phase = getattr(env, "_so101_reset_phase", None)
-        if phase is not None:
-            log["Reset/mean_phase"] = phase.float().mean()
 
         return success
 
@@ -272,7 +188,7 @@ def vial_lost(env: ManagerBasedRLEnv) -> torch.Tensor:
     finite = torch.isfinite(vial_pos).all(dim=-1) & torch.isfinite(vial.data.root_quat_w.torch).all(dim=-1)
     finite &= torch.isfinite(vial.data.root_lin_vel_w.torch).all(dim=-1)
     finite &= torch.isfinite(vial.data.root_ang_vel_w.torch).all(dim=-1)
-    dropped = _history(env).lifted & (pos[:, 2] < 0.004)
+    dropped = _history(env).lifted & (vial_clearance(env) < 0.002)
     return (~finite) | dropped | (pos[:, 2] < -0.01) | (pos[:, 0].abs() > 0.62) | (pos[:, 1].abs() > 0.50)
 
 
@@ -290,32 +206,12 @@ def unstable_robot(env: ManagerBasedRLEnv) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def held_object_goal_error(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the symmetry-aware vial pose error to the held insertion pose [m]."""
-    vial: RigidObject = env.scene["vial"]
-    rack: RigidObject = env.scene["rack"]
-    rack_quat = rack.data.root_quat_w.torch
-    vial_position = rack_local_position(vial.data.root_pos_w.torch, rack.data.root_pos_w.torch, rack_quat)
-    vial_axis_w = quat_apply(
-        vial.data.root_quat_w.torch, vial_position.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_position)
-    )
-    error = symmetric_axial_keypoint_error(
-        vial_position,
-        quat_apply_inverse(rack_quat, vial_axis_w),
-        vial_position.new_tensor(HELD_INSERTION_TARGET).expand_as(vial_position),
-        vial_position.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_position),
-        VIAL_AXIS_MIN,
-        VIAL_AXIS_MAX,
-    )
-    return _finite_error(error)
-
-
 class ApproachProgressReward(ManagerTermBase):
     """Pay the decrease in jaw-to-cap distance, in units of ``scale``, until the vial is grasped.
 
-    A shaping term expressed as a difference of potentials has no incentive to hover: the total paid over an approach
-    equals the distance covered. It also supplies the same gradient 25 cm from the vial as 2 cm away, which is what
-    lets a pixels-only policy discover the approach from the home pose; a Gaussian bump around the cap is flat there.
+    Undiscounted distance changes telescope: retreating and returning to the same distance pays zero net reward.
+    Do not clip individual increments; that makes a large retreat cheaper than several small approach steps.
+    The first call after a reset initializes the reference distance without paying a reward.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
@@ -329,52 +225,40 @@ class ApproachProgressReward(ManagerTermBase):
 
     def __call__(self, env: ManagerBasedRLEnv, scale: float = 0.01) -> torch.Tensor:
         distance = _finite_error(torch.linalg.vector_norm(grasp_center_w(env) - vial_grasp_point_w(env), dim=-1))
-        progress = ((self._previous_distance - distance) / scale).clamp(-1.0, 1.0)
+        progress = (self._previous_distance - distance) / scale
         active = self._has_previous & ~_history(env).grasped
         self._previous_distance.copy_(distance)
         self._has_previous.fill_(True)
         return torch.where(active, progress, torch.zeros_like(progress))
 
 
-def held_goal_reward(env: ManagerBasedRLEnv, goal_std: float = 0.10) -> torch.Tensor:
-    """Dense shaping that brings the held vial to the insertion pose.
-
-    Active only while the vial is grasped and its tip is not yet in the opening, so opening the jaws is the only
-    profitable continuation after insertion. There is deliberately no equivalent bump around the vial before the grasp:
-    a policy whose grasp is still unreliable learns to hover in such a bump instead of attempting the grasp.
-    """
-    history = _history(env)
-    goal = torch.exp(-held_object_goal_error(env) / goal_std)
-    held = history.grasped & ~history.inserted
-    return _finite(torch.where(held, goal, torch.zeros_like(goal)))
+def lift_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Reward live bilateral grasps in proportion to clearance, capped at the success height."""
+    fraction = (vial_clearance(env) / LIFT_TARGET_CLEARANCE).clamp(0.0, 1.0)
+    return _finite(torch.where(bilateral_contact(env), fraction, torch.zeros_like(fraction)))
 
 
 class PhysicalMilestoneReward(ManagerTermBase):
-    """Pay each physical milestone (grasped, lifted, inserted) exactly once per episode.
+    """Pay each physical milestone (grasped, lifted) exactly once per episode.
 
-    Milestones already present on the first step after a reset are never paid, so downstream resets are not
-    rewarded merely for being loaded.
+    A milestone latched in the current episode cannot pay again after losing and regaining the grasp.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self._previous = torch.zeros((self.num_envs, 3), dtype=torch.bool, device=self.device)
-        self._initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._previous = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         ids = slice(None) if env_ids is None else env_ids
         self._previous[ids] = False
-        self._initialized[ids] = False
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
         history = _history(env)
-        current = torch.stack((history.grasped, history.lifted, history.inserted), dim=-1)
+        current = torch.stack((history.grasped, history.lifted), dim=-1)
         newly_reached = current & ~self._previous
-        weights = current.new_tensor((1.0, 2.0, 4.0), dtype=torch.float32)
+        weights = current.new_tensor((1.0, 2.0), dtype=torch.float32)
         reward = (newly_reached.float() * weights).sum(dim=-1)
-        reward = torch.where(self._initialized, reward, torch.zeros_like(reward))
         self._previous.copy_(current)
-        self._initialized.fill_(True)
         return _finite(reward)
 
 
@@ -389,9 +273,18 @@ def success_bonus(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def progress_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the latched milestone flags (grasped, lifted, inserted) that make the reward Markov."""
+    """Return the latched grasp and lift milestones that make the milestone reward Markov."""
     history = _history(env)
-    return torch.stack((history.grasped, history.lifted, history.inserted), dim=-1).float()
+    return torch.stack((history.grasped, history.lifted), dim=-1).float()
+
+
+def lift_features(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return clearance, jaw opening, and normalized grasp/hold counters."""
+    history = _history(env)
+    grasp_fraction = (history.grasp_count.float() / history.grasp_steps).clamp(0.0, 1.0)
+    hold_fraction = (history.stable_count.float() / history.stable_steps).clamp(0.0, 1.0)
+    clearance = _finite(vial_clearance(env)).clamp(-1.0, 1.0)
+    return torch.stack((clearance, _gripper_openness(env), grasp_fraction, hold_fraction), dim=-1)
 
 
 def contact_state(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -417,10 +310,11 @@ def joint_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg | None = None) -
     return _finite(robot.data.joint_vel.torch[:, asset_cfg.joint_ids]).clamp(-12.0, 12.0)
 
 
-def joint_target(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the six joint-position targets sent to the drives."""
-    robot: Articulation = env.scene["robot"]
-    return _finite(robot.data.joint_pos_target.torch).clamp(-4.0, 4.0)
+def joint_target(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg | None = None) -> torch.Tensor:
+    """Return drive targets in the same selected order as the measured joint state."""
+    asset_cfg = SceneEntityCfg("robot") if asset_cfg is None else asset_cfg
+    robot: Articulation = env.scene[asset_cfg.name]
+    return _finite(robot.data.joint_pos_target.torch[:, asset_cfg.joint_ids]).clamp(-4.0, 4.0)
 
 
 def last_action(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -468,15 +362,3 @@ def rigid_object_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> tor
         dim=-1,
     )
     return _finite(state).clamp(-10.0, 10.0)
-
-
-def rack_relative_target(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the vial position in the rack frame [m]."""
-    return _finite(_placement_values(env)[0]).clamp(-1.0, 1.0)
-
-
-def placement_features(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the nonlinear insertion geometry a compact actor would otherwise have to derive from raw poses."""
-    local, alignment, linear_speed, _, _, _ = _placement_values(env)
-    xy_distance = torch.linalg.vector_norm(local[:, :2], dim=-1)
-    return torch.stack((xy_distance, vial_lowest_height_in_rack(env), alignment, linear_speed), dim=-1).clamp(-1, 1)

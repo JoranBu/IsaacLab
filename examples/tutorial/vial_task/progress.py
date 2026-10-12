@@ -12,17 +12,16 @@ from collections.abc import Sequence
 import torch
 
 
-class PlacementProgress:
-    """Track three sticky physical milestones and stable placement success.
+class LiftProgress:
+    """Track grasp/lift milestones and sustained lift success.
 
     Each milestone is a physical fact that is latched the first time it is observed in an episode:
 
     * ``grasped``: both jaws touch the vial while it is held off the mat,
-    * ``lifted``: the vial's lowest point has cleared the top of the rack,
-    * ``inserted``: the vial's tip is inside the target rack opening.
+    * ``lifted``: the grasped vial reaches the target clearance above the mat.
 
-    ``success`` latches after the released vial rests upright inside the opening for ``stable_steps`` consecutive
-    control steps. Success is a purely physical outcome; it does not depend on which milestones were observed.
+    ``success`` latches after a confirmed grasp is held above the target clearance for ``stable_steps`` consecutive
+    control steps. Losing the live grasp or falling below the target resets the hold counter.
     """
 
     def __init__(self, num_envs: int, device: str | torch.device, stable_steps: int = 10, grasp_steps: int = 2):
@@ -30,9 +29,7 @@ class PlacementProgress:
         self.grasp_steps = grasp_steps
         self.grasped = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.lifted = torch.zeros_like(self.grasped)
-        self.inserted = torch.zeros_like(self.grasped)
         self.success = torch.zeros_like(self.grasped)
-        self.unsafe_rack_contact = torch.zeros_like(self.grasped)
         self.grasp_count = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.stable_count = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.time_to_success = torch.full((num_envs,), -1, dtype=torch.long, device=device)
@@ -42,9 +39,7 @@ class PlacementProgress:
         ids = slice(None) if env_ids is None else env_ids
         self.grasped[ids] = False
         self.lifted[ids] = False
-        self.inserted[ids] = False
         self.success[ids] = False
-        self.unsafe_rack_contact[ids] = False
         self.grasp_count[ids] = 0
         self.stable_count[ids] = 0
         self.time_to_success[ids] = -1
@@ -52,18 +47,16 @@ class PlacementProgress:
     def update(
         self,
         holding: torch.Tensor,
-        cleared: torch.Tensor,
-        inserted: torch.Tensor,
-        seated: torch.Tensor,
+        above_target: torch.Tensor,
         step: torch.Tensor,
     ) -> torch.Tensor:
         """Latch milestones from the current physical state and return confirmed success."""
         self.grasp_count.copy_(torch.where(holding, self.grasp_count + 1, torch.zeros_like(self.grasp_count)))
         self.grasped |= self.grasp_count >= self.grasp_steps
-        self.lifted |= cleared
-        self.inserted |= inserted
-        self.stable_count.copy_(torch.where(seated, self.stable_count + 1, torch.zeros_like(self.stable_count)))
-        newly_successful = ~self.success & (self.stable_count >= self.stable_steps)
+        held_at_target = holding & above_target
+        self.lifted |= self.grasped & held_at_target
+        self.stable_count.copy_(torch.where(held_at_target, self.stable_count + 1, torch.zeros_like(self.stable_count)))
+        newly_successful = ~self.success & self.grasped & (self.stable_count >= self.stable_steps)
         self.time_to_success.copy_(torch.where(newly_successful, step, self.time_to_success))
         self.success |= newly_successful
         return self.success.clone()

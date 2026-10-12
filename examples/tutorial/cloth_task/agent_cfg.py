@@ -14,7 +14,7 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 @configclass
 class BoundedGaussianDistributionCfg(RslRlMLPModelCfg.GaussianDistributionCfg):
-    """Bound exploration noise for normalized relative joint commands."""
+    """Bound exploration noise for normalized relative fingertip commands."""
 
     std_range: tuple[float, float] = (0.05, 0.3)
 
@@ -36,14 +36,14 @@ PPO_ALGORITHM_CFG = RslRlPpoAlgorithmCfg(
 
 
 @configclass
-class SO101StatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """State policy with a fully observed actor and a privileged critic."""
+class ClothStatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """State policy with a compact cloth-state actor and a privileged critic."""
 
     seed = 42
     num_steps_per_env = 64
     max_iterations = 800
     save_interval = 50
-    experiment_name = "cloth_franka_lift"
+    experiment_name = "cloth_franka_deformable_lift"
     run_name = ""
     obs_groups = {"actor": ["policy"], "critic": ["critic"]}
     clip_actions = 1.0

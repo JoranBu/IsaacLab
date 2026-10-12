@@ -14,7 +14,7 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 
 @configclass
 class BoundedGaussianDistributionCfg(RslRlMLPModelCfg.GaussianDistributionCfg):
-    """Bound exploration noise for normalized relative joint commands."""
+    """Bound exploration noise for normalized relative fingertip commands."""
 
     std_range: tuple[float, float] = (0.05, 0.3)
 
@@ -43,7 +43,7 @@ class SO101StatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 64
     max_iterations = 800
     save_interval = 50
-    experiment_name = "so101_vial_state"
+    experiment_name = "cloth_franka_lift_relative_ik"
     run_name = ""
     obs_groups = {"actor": ["policy"], "critic": ["critic"]}
     clip_actions = 1.0

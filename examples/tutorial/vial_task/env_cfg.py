@@ -5,12 +5,9 @@
 
 # Adapted from isaac-sim/IsaacLabTutorial (Apache-2.0); see ../LICENSE-IsaacLabTutorial.
 
-"""Manager-based SO-101 vial placement task with physical reset replay."""
+"""Manager-based Franka vial-lifting task."""
 
 from __future__ import annotations
-
-import math
-from pathlib import Path
 
 import newton
 from isaaclab_newton.physics import (
@@ -20,11 +17,13 @@ from isaaclab_newton.physics import (
     NewtonCollisionPipelineCfg,
     NewtonManager,
 )
+from isaaclab_newton.sim.schemas import MujocoRigidBodyCfg, NewtonArticulationCfg
+from isaaclab_physx.sim.schemas import PhysxArticulationCfg
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, mdp
-from isaaclab.envs.mdp.actions.actions_cfg import RelativeJointPositionActionCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -35,29 +34,23 @@ from isaaclab.physics import PhysicsEvent
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationContext
+from isaaclab.utils import configclass, replace
 from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
-from isaaclab.utils.configclass import configclass
 from isaaclab.visualizers import VisualizerCfg
 
 from isaaclab_tasks.utils import PresetCfg
 
-from isaaclab_assets.robots.so101 import SO101_CFG
+from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG
 
-from . import resets, terms
-from .actions import SoftLimitRelativeGripperActionCfg
+from . import terms
+from .actions import BoundedDifferentialIKActionCfg
 
 ASSET_DIR = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Vial_Rack"
-RESET_DATASET = Path(__file__).with_name("reset_poses.npz")
-CANONICAL_START = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-ALL_PHASES = (1.0,) * 8
 TABLETOP_VIAL_POSITION = (0.231, -0.017, 0.06)
-TABLETOP_VIAL_HEADING_RANGE = (-0.35, 0.35)
-PREGRASP_GRIPPER_POSITION = math.radians(-10.0 + 1.1 * 22.4)
-GRASP_GRIPPER_POSITION = math.radians(-10.0 + 1.1 * 1.0)
-RELEASE_GRIPPER_POSITION = math.radians(-10.0 + 1.1 * 42.7)
-JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-ARM_JOINTS = JOINTS[:-1]
-WORKSHOP_INITIAL_JOINT_POSITION = tuple(SO101_CFG.init_state.joint_pos[name] for name in JOINTS)
+ARM_JOINTS = [f"panda_joint{index}" for index in range(1, 8)]
+FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
+# Keep positions, velocities, and drive targets in the same explicit policy order.
+JOINTS = ARM_JOINTS + FINGER_JOINTS
 
 
 _CONTACT_STIFFNESS = 1.57e5
@@ -68,6 +61,8 @@ _TORSIONAL_FRICTION = 0.005
 _SOLIMP = (0.7, 0.95, 0.0001, 0.5, 2.0)
 _SOLREF = (0.002, 1.5)
 _contact_model_registered = False
+
+TCP_OFFSET = (0.0, 0.0, 0.107)  # From panda_hand to the point between the fingertips.
 
 
 def _initialize_contacts(_event: PhysicsEvent) -> None:
@@ -113,21 +108,30 @@ _register_contact_model()
 
 
 @configclass
-class SO101SceneCfg(InteractiveSceneCfg):
-    """One SO-101, one vial, one rack, and a collision mat."""
+class FrankaSceneCfg(InteractiveSceneCfg):
+    """One Franka, one vial, and a collision mat."""
 
-    robot = SO101_CFG.replace(
+    robot: ArticulationCfg = replace(
+        FRANKA_PANDA_HIGH_PD_CFG,
         prim_path="{ENV_REGEX_NS}/Robot",
-        spawn=SO101_CFG.spawn.replace(
-            activate_contact_sensors=True,
+        soft_joint_pos_limit_factor=0.95,
+        spawn=replace(
+            FRANKA_PANDA_HIGH_PD_CFG.spawn,
+            # MJWarp needs its own gravity compensation for zero-action relative IK to hold the arm.
+            rigid_props=[FRANKA_PANDA_HIGH_PD_CFG.spawn.rigid_props, MujocoRigidBodyCfg(gravcomp=1.0)],
         ),
-        init_state=SO101_CFG.init_state.replace(
-            pos=(-0.05, 0.0, 0.0),
-            # Isaac Lab 3 uses XYZW quaternions: +90 degrees about world Z.
-            rot=(0.0, 0.0, 0.7071068, 0.7071068),
-        ),
-        soft_joint_pos_limit_factor=0.98,
     )
+
+    def __post_init__(self):
+        # This task uses Newton/MJWarp; the shared asset defaults to the PhysX payload.
+        self.robot.spawn.variants["Physics"] = "mujoco"
+        self.robot.spawn.variants["Colliders"] = "convex_hulls"
+        self.robot.spawn.activate_contact_sensors = True
+        for properties in self.robot.spawn.articulation_props:
+            if isinstance(properties, NewtonArticulationCfg):
+                properties.self_collision_enabled = True
+            elif isinstance(properties, PhysxArticulationCfg):
+                properties.enabled_self_collisions = True
 
     vial = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Vial",
@@ -137,12 +141,6 @@ class SO101SceneCfg(InteractiveSceneCfg):
             # Horizontal vial: +90 degrees about world Y (XYZW).
             rot=(0.0, 0.7071068, 0.0, 0.7071068),
         ),
-    )
-
-    rack = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Rack",
-        spawn=sim_utils.UsdFileCfg(usd_path=f"{ASSET_DIR}/rack.usda"),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.18, 0.08, 0.04)),
     )
 
     mat = AssetBaseCfg(
@@ -155,19 +153,13 @@ class SO101SceneCfg(InteractiveSceneCfg):
     )
 
     fixed_jaw_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/gripper",
+        prim_path="{ENV_REGEX_NS}/Robot/(Geometry/.*/)?panda_leftfinger",
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Vial"],
         history_length=4,
     )
     moving_jaw_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/moving_jaw_so101_v1",
+        prim_path="{ENV_REGEX_NS}/Robot/(Geometry/.*/)?panda_rightfinger",
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Vial"],
-        history_length=4,
-    )
-
-    vial_rack_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Vial",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Rack"],
         history_length=4,
     )
 
@@ -179,22 +171,30 @@ class SO101SceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """Bounded relative joint targets matching the real SO-101 interface."""
+    """Small fingertip pose increments in the robot base frame, then an open/close command."""
 
-    arm_action: RelativeJointPositionActionCfg = RelativeJointPositionActionCfg(
+    arm = BoundedDifferentialIKActionCfg(
         asset_name="robot",
         joint_names=ARM_JOINTS,
-        preserve_order=True,
-        # Larger steps increased failures and rack forces in evaluation.
-        scale=0.033,
-        use_zero_offset=True,
+        body_name="panda_hand",
+        body_offset=mdp.DifferentialInverseKinematicsActionCfg.OffsetCfg(pos=TCP_OFFSET),
+        # Normalized arm actions map to metres and rotation-vector radians per control step.
+        scale=(0.02, 0.02, 0.02, 0.1, 0.1, 0.1),
+        controller=DifferentialIKControllerCfg(
+            command_type="pose",
+            use_relative_mode=True,
+            ik_method="dls",
+            ik_params={"lambda_val": 0.05},
+            joint_limit_avoidance_gain=0.05,
+            joint_limit_avoidance_margin=0.1,
+        ),
     )
-    gripper_action: SoftLimitRelativeGripperActionCfg = SoftLimitRelativeGripperActionCfg(
+    gripper = mdp.BinaryJointPositionActionCfg(
         asset_name="robot",
-        joint_names=["gripper"],
-        # Avoid opening a grasp rapidly from a small policy bias.
-        scale=0.02,
-        use_zero_offset=True,
+        # The flat Franka asset drives finger 1; finger 2 follows its mimic constraint.
+        joint_names=[FINGER_JOINTS[0]],
+        open_command_expr={FINGER_JOINTS[0]: 0.04},
+        close_command_expr={FINGER_JOINTS[0]: 0.0},
     )
 
 
@@ -202,14 +202,21 @@ class ActionsCfg:
 class PolicyStateGroupCfg(ObsGroup):
     """Fully observed state actor inputs."""
 
-    joint_pos = ObsTerm(func=terms.joint_pos, params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINTS)})
-    joint_vel = ObsTerm(func=terms.joint_vel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINTS)})
-    joint_target = ObsTerm(func=terms.joint_target)
+    joint_pos = ObsTerm(
+        func=terms.joint_pos, params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINTS, preserve_order=True)}
+    )
+    joint_vel = ObsTerm(
+        func=terms.joint_vel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINTS, preserve_order=True)}
+    )
+    joint_target = ObsTerm(
+        func=terms.joint_target, params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINTS, preserve_order=True)}
+    )
     previous_action = ObsTerm(func=terms.last_action)
-    end_effector = ObsTerm(func=terms.body_state, params={"asset_cfg": SceneEntityCfg("robot", body_names="gripper")})
+    end_effector = ObsTerm(
+        func=terms.body_state, params={"asset_cfg": SceneEntityCfg("robot", body_names="panda_hand")}
+    )
     vial = ObsTerm(func=terms.rigid_object_state, params={"asset_cfg": SceneEntityCfg("vial")})
-    rack_target = ObsTerm(func=terms.rack_relative_target)
-    placement = ObsTerm(func=terms.placement_features)
+    lift = ObsTerm(func=terms.lift_features)
     # Latched milestones make the once-per-episode milestone rewards Markov.
     progress = ObsTerm(func=terms.progress_flags)
 
@@ -232,8 +239,8 @@ class ObservationsCfg:
 
 
 @configclass
-class DatasetEventsCfg:
-    """Task-horizon resets plus modest physical domain randomization."""
+class DefaultEventsCfg:
+    """Franka home-pose resets plus modest physical domain randomization."""
 
     vial_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
@@ -256,29 +263,29 @@ class DatasetEventsCfg:
             "operation": "abs",
         },
     )
-    reset_from_dataset = EventTerm(
-        func=resets.ResetFromDataset,
+    reset_scene = EventTerm(
+        func=mdp.reset_scene_to_default,
         mode="reset",
-        params={"dataset_path": str(RESET_DATASET), "sequential": False, "phase_weights": ALL_PHASES},
+        params={"reset_joint_targets": True},
     )
 
 
 @configclass
 class RewardsCfg:
-    """Sparse physical milestones, a success bonus, two dense shaping terms, and light regularization."""
+    """Approach and lift shaping, grasp/lift milestones, success, and light regularization."""
 
     approach_progress = RewTerm(func=terms.ApproachProgressReward, weight=1.0)
-    held_goal = RewTerm(func=terms.held_goal_reward, weight=0.1)
+    lift = RewTerm(func=terms.lift_reward, weight=0.1)
     milestones = RewTerm(func=terms.PhysicalMilestoneReward, weight=10.0)
     success = RewTerm(func=terms.success_bonus, weight=200.0)
-    vial_lost = RewTerm(func=terms.vial_lost, weight=-50.0)
+    vial_lost = RewTerm(func=terms.vial_lost, weight=-0.5)
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
     joint_velocity = RewTerm(func=mdp.joint_vel_l2, weight=-0.0002)
 
 
 @configclass
 class TerminationsCfg:
-    success = DoneTerm(func=terms.PlacementHistoryTerm)
+    success = DoneTerm(func=terms.LiftHistoryTerm)
     vial_lost = DoneTerm(func=terms.vial_lost)
     unstable_robot = DoneTerm(func=terms.unstable_robot)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
@@ -296,7 +303,7 @@ class PhysicsCfg(PresetCfg):
             impratio=10.0,
             update_data_interval=2,
             iterations=100,
-            ls_iterations=50, #used to be 15, but gave many warnings
+            ls_iterations=50,  # used to be 15, but gave many warnings
             use_mujoco_contacts=False,
             ccd_iterations=35,
         ),
@@ -308,13 +315,13 @@ class PhysicsCfg(PresetCfg):
 
 
 @configclass
-class SO101VialEnvCfg(ManagerBasedRLEnvCfg):
-    """State task trained from physics-validated reset poses."""
+class ClothEnvCFG(ManagerBasedRLEnvCfg):
+    """Franka state task starting from the asset's configured home pose."""
 
-    scene: SO101SceneCfg = SO101SceneCfg(num_envs=4096, env_spacing=0.9, replicate_physics=True)
+    scene: FrankaSceneCfg = FrankaSceneCfg(num_envs=4096, env_spacing=0.9, replicate_physics=True)
     actions: ActionsCfg = ActionsCfg()
     observations: ObservationsCfg = ObservationsCfg()
-    events: DatasetEventsCfg = DatasetEventsCfg()
+    events: DefaultEventsCfg = DefaultEventsCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
 
@@ -328,32 +335,6 @@ class SO101VialEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.default_visualizer_cfg = VisualizerCfg(eye=(0.64, 0.0, 0.36), lookat=(0.19, 0.02, 0.075))
 
     def play_mode(self):
-        """Play and evaluate complete episodes from the canonical home-pose starts, in dataset order."""
+        """Play complete episodes from the Franka home pose."""
         super().play_mode()
         self.scene.num_envs = min(self.scene.num_envs, 16)
-        self.events.reset_from_dataset.params["sequential"] = True
-        self.events.reset_from_dataset.params["phase_weights"] = CANONICAL_START
-
-
-@configclass
-class GeneratorEventsCfg:
-    """Give the generator a fixed 20 g vial; it initializes candidate poses explicitly."""
-
-    vial_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("vial"),
-            "mass_distribution_params": (0.02, 0.02),
-            "operation": "abs",
-        },
-    )
-
-
-@configclass
-class SO101VialGeneratorEnvCfg(SO101VialEnvCfg):
-    """Reuse the task scene and physics for directly commanded candidate rollouts."""
-
-    events: GeneratorEventsCfg = GeneratorEventsCfg()
-    rewards = None
-    terminations = None

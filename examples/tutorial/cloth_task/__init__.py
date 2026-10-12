@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Register the state-based Franka vial-lifting task."""
+"""Register the state-based Franka cloth-lifting task."""
 
 import gymnasium as gym
 
@@ -15,7 +15,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.env_cfg:ClothEnvCFG",
-        "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:SO101StatePPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:ClothStatePPORunnerCfg",
         "default_agent": "rsl_rl",
     },
 )

@@ -17,8 +17,8 @@ class LiftProgress:
 
     Each milestone is a physical fact that is latched the first time it is observed in an episode:
 
-    * ``grasped``: both jaws touch the vial while it is held off the mat,
-    * ``lifted``: the grasped vial reaches the target clearance above the mat.
+    * ``grasped``: a closed-jaw cloth pinch is confirmed while it is held off the mat,
+    * ``lifted``: the entire grasped cloth reaches the target clearance above the mat.
 
     ``success`` latches after a confirmed grasp is held above the target clearance for ``stable_steps`` consecutive
     control steps. Losing the live grasp or falling below the target resets the hold counter.

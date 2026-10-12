@@ -5,7 +5,7 @@
 
 # Adapted from isaac-sim/IsaacLabTutorial (Apache-2.0); see ../LICENSE-IsaacLabTutorial.
 
-"""Manager-based Franka vial-lifting task."""
+"""Manager-based Franka cloth-lifting task."""
 
 from __future__ import annotations
 
@@ -16,10 +16,16 @@ from isaaclab_newton.physics import (
     NewtonCfg,
     NewtonCollisionPipelineCfg,
     NewtonManager,
+    NewtonSoftContactCfg,
+    VBDSolverCfg,
 )
+from isaaclab_newton.sim.schemas import MujocoRigidBodyCfg, NewtonArticulationCfg
+from isaaclab_newton.sim.schemas.schemas_cfg import NewtonDeformableBodyPropertiesCfg
+from isaaclab_newton.sim.spawners.materials.physics_materials_cfg import NewtonSurfaceDeformableBodyMaterialCfg
+from isaaclab_physx.sim.schemas import PhysxArticulationCfg
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, mdp
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -30,20 +36,23 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.physics import PhysicsEvent
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import configclass, replace
 from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
 from isaaclab.visualizers import VisualizerCfg
+
+from isaaclab_contrib.coupling import CouplerEntryCfg, CouplerProxyCfg, CouplerProxyMappingCfg
 
 from isaaclab_tasks.utils import PresetCfg
 
 from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG
 
 from . import terms
+from .actions import BoundedDifferentialIKActionCfg
 
-ASSET_DIR = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Vial_Rack"
-TABLETOP_VIAL_POSITION = (0.231, -0.017, 0.06)
+ASSET_DIR = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Vial_Rack"  # Tabletop assets shared with the vial task.
+TABLETOP_CLOTH_POSITION = (0.231, -0.017, terms.MAT_TOP_HEIGHT + terms.CLOTH_PARTICLE_RADIUS + 0.001)
+CLOTH_SIZE = (0.24, 0.24)
 ARM_JOINTS = [f"panda_joint{index}" for index in range(1, 8)]
 FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
 # Keep positions, velocities, and drive targets in the same explicit policy order.
@@ -106,22 +115,47 @@ _register_contact_model()
 
 @configclass
 class FrankaSceneCfg(InteractiveSceneCfg):
-    """One Franka, one vial, and a collision mat."""
+    """One Franka, one cloth, and a collision mat."""
 
-    robot: ArticulationCfg = replace(FRANKA_PANDA_HIGH_PD_CFG, prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = replace(
+        FRANKA_PANDA_HIGH_PD_CFG,
+        prim_path="{ENV_REGEX_NS}/Robot",
+        soft_joint_pos_limit_factor=0.95,
+        spawn=replace(
+            FRANKA_PANDA_HIGH_PD_CFG.spawn,
+            # MJWarp needs its own gravity compensation for zero-action relative IK to hold the arm.
+            rigid_props=[FRANKA_PANDA_HIGH_PD_CFG.spawn.rigid_props, MujocoRigidBodyCfg(gravcomp=1.0)],
+        ),
+    )
 
     def __post_init__(self):
         # This task uses Newton/MJWarp; the shared asset defaults to the PhysX payload.
         self.robot.spawn.variants["Physics"] = "mujoco"
-        self.robot.spawn.activate_contact_sensors = True
+        self.robot.spawn.variants["Colliders"] = "convex_hulls"
+        self.robot.spawn.activate_contact_sensors = False
+        for properties in self.robot.spawn.articulation_props:
+            if isinstance(properties, NewtonArticulationCfg):
+                properties.self_collision_enabled = True
+            elif isinstance(properties, PhysxArticulationCfg):
+                properties.enabled_self_collisions = True
 
-    vial = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Vial",
-        spawn=sim_utils.UsdFileCfg(usd_path=f"{ASSET_DIR}/vial.usda"),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=TABLETOP_VIAL_POSITION,
-            # Horizontal vial: +90 degrees about world Y (XYZW).
-            rot=(0.0, 0.7071068, 0.0, 0.7071068),
+    cloth: DeformableObjectCfg = DeformableObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Cloth",
+        init_state=DeformableObjectCfg.InitialStateCfg(pos=TABLETOP_CLOTH_POSITION),
+        spawn=sim_utils.MeshRectangleCfg(
+            size=CLOTH_SIZE,
+            edge_refinement=8,  # Dense vertices help the fingers contact the thin sheet.
+            deformable_props=NewtonDeformableBodyPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.95, 0.65, 0.12)),
+            physics_material=NewtonSurfaceDeformableBodyMaterialCfg(
+                density=1.0,  # Surface mass density [kg/m^2].
+                particle_radius=terms.CLOTH_PARTICLE_RADIUS,  # Finite collision thickness around each vertex.
+                tri_ke=500.0,  # Resistance to in-plane stretching.
+                tri_ka=0.5,  # Resistance to changes in triangle area.
+                tri_kd=0.001,  # Damping of in-plane deformation.
+                edge_ke=0.05,  # Bending resistance across triangle edges.
+                edge_kd=0.001,
+            ),
         ),
     )
 
@@ -134,17 +168,6 @@ class FrankaSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    fixed_jaw_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/(Geometry/.*/)?panda_leftfinger",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Vial"],
-        history_length=4,
-    )
-    moving_jaw_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/(Geometry/.*/)?panda_rightfinger",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Vial"],
-        history_length=4,
-    )
-
     light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(intensity=1200.0, color=(0.9, 0.9, 0.9)),
@@ -153,15 +176,26 @@ class FrankaSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """Absolute fingertip pose in the robot base frame, then an open/close command."""
+    """Small fingertip pose increments in the robot base frame, then an open/close command."""
 
-    arm = mdp.DifferentialInverseKinematicsActionCfg(
+    arm = BoundedDifferentialIKActionCfg(
         asset_name="robot",
         joint_names=ARM_JOINTS,
         body_name="panda_hand",
         body_offset=mdp.DifferentialInverseKinematicsActionCfg.OffsetCfg(pos=TCP_OFFSET),
+        # Thin-sheet contact requires a lower fingertip goal than the vial's 4 cm boundary.
+        workspace_lower=(0.10, -0.35, terms.MAT_TOP_HEIGHT),
+        # Keep bounded commands while permitting the longer descent within a 20 s cloth episode.
+        joint_target_speed_limit=4.0,
+        # Normalized arm actions map to metres and rotation-vector radians per control step.
+        scale=(0.02, 0.02, 0.02, 0.1, 0.1, 0.1),
         controller=DifferentialIKControllerCfg(
-            command_type="pose", use_relative_mode=False, ik_method="dls", ik_params={"lambda_val": 0.05}
+            command_type="pose",
+            use_relative_mode=True,
+            ik_method="dls",
+            ik_params={"lambda_val": 0.05},
+            joint_limit_avoidance_gain=0.05,
+            joint_limit_avoidance_margin=0.1,
         ),
     )
     gripper = mdp.BinaryJointPositionActionCfg(
@@ -175,7 +209,7 @@ class ActionsCfg:
 
 @configclass
 class PolicyStateGroupCfg(ObsGroup):
-    """Fully observed state actor inputs."""
+    """Robot state and a compact cloth-shape observation."""
 
     joint_pos = ObsTerm(
         func=terms.joint_pos, params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINTS, preserve_order=True)}
@@ -190,7 +224,7 @@ class PolicyStateGroupCfg(ObsGroup):
     end_effector = ObsTerm(
         func=terms.body_state, params={"asset_cfg": SceneEntityCfg("robot", body_names="panda_hand")}
     )
-    vial = ObsTerm(func=terms.rigid_object_state, params={"asset_cfg": SceneEntityCfg("vial")})
+    cloth = ObsTerm(func=terms.ClothState)
     lift = ObsTerm(func=terms.lift_features)
     # Latched milestones make the once-per-episode milestone rewards Markov.
     progress = ObsTerm(func=terms.progress_flags)
@@ -215,29 +249,8 @@ class ObservationsCfg:
 
 @configclass
 class DefaultEventsCfg:
-    """Franka home-pose resets plus modest physical domain randomization."""
+    """Restore the robot home pose, cloth mesh, velocities, and drive targets."""
 
-    vial_material = EventTerm(
-        func=mdp.randomize_rigid_body_material,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("vial"),
-            "static_friction_range": (0.7, 1.3),
-            "dynamic_friction_range": (0.7, 1.3),
-            "restitution_range": (0.0, 0.02),
-            "num_buckets": 32,
-        },
-    )
-    vial_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("vial"),
-            # Newton cannot reliably infer mass from the detailed mesh.
-            "mass_distribution_params": (0.015, 0.025),
-            "operation": "abs",
-        },
-    )
     reset_scene = EventTerm(
         func=mdp.reset_scene_to_default,
         mode="reset",
@@ -253,47 +266,77 @@ class RewardsCfg:
     lift = RewTerm(func=terms.lift_reward, weight=0.1)
     milestones = RewTerm(func=terms.PhysicalMilestoneReward, weight=10.0)
     success = RewTerm(func=terms.success_bonus, weight=200.0)
-    vial_lost = RewTerm(func=terms.vial_lost, weight=-50.0)
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
     joint_velocity = RewTerm(func=mdp.joint_vel_l2, weight=-0.0002)
+    cloth_lost = RewTerm(func=terms.cloth_lost, weight=-0.5)
 
 
 @configclass
 class TerminationsCfg:
     success = DoneTerm(func=terms.LiftHistoryTerm)
-    vial_lost = DoneTerm(func=terms.vial_lost)
+    cloth_lost = DoneTerm(func=terms.cloth_lost)
     unstable_robot = DoneTerm(func=terms.unstable_robot)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
 
 @configclass
 class PhysicsCfg(PresetCfg):
-    newton_mjwarp = NewtonCfg(
-        solver_cfg=MJWarpSolverCfg(
-            solver="newton",
-            integrator="implicitfast",
-            njmax=300,
-            nconmax=200,
-            cone="elliptic",
-            impratio=10.0,
-            update_data_interval=2,
-            iterations=100,
-            ls_iterations=50,  # used to be 15, but gave many warnings
-            use_mujoco_contacts=False,
-            ccd_iterations=35,
+    newton_mjwarp_vbd = NewtonCfg(
+        solver_cfg=CouplerProxyCfg(
+            entries=[
+                CouplerEntryCfg(
+                    name="robot",
+                    solver_cfg=MJWarpSolverCfg(
+                        solver="newton",
+                        integrator="implicitfast",
+                        njmax=300,
+                        nconmax=200,
+                        cone="elliptic",
+                        impratio=10.0,
+                        iterations=100,
+                        ls_iterations=50,
+                        use_mujoco_contacts=False,
+                        ccd_iterations=35,
+                    ),
+                    bodies=[r"/World/envs/env_[^/]+/Robot"],
+                    include_static_shapes=True,
+                ),
+                CouplerEntryCfg(
+                    name="cloth",
+                    solver_cfg=VBDSolverCfg(
+                        iterations=20,
+                        rigid_body_particle_contact_buffer_size=1024,
+                        particle_enable_self_contact=True,
+                        particle_self_contact_radius=terms.CLOTH_PARTICLE_RADIUS,
+                        particle_self_contact_margin=2.0 * terms.CLOTH_PARTICLE_RADIUS,
+                    ),
+                    all_particles=True,
+                ),
+            ],
+            proxies=[
+                CouplerProxyMappingCfg(
+                    source="robot",
+                    destination="cloth",
+                    bodies=[r"/World/envs/env_[^/]+/Robot"],
+                    mode="lagged",
+                    collide_interval=1,
+                    collision_pipeline=NewtonCollisionPipelineCfg(),
+                ),
+            ],
+            iterations=1,
         ),
-        collision_cfg=NewtonCollisionPipelineCfg(),
-        num_substeps=2,
+        soft_contact_cfg=NewtonSoftContactCfg(soft_contact_ke=8000.0, soft_contact_kd=0.01, soft_contact_mu=0.7),
+        num_substeps=4,
         debug_mode=False,
     )
-    default = newton_mjwarp
+    default = newton_mjwarp_vbd
 
 
 @configclass
 class ClothEnvCFG(ManagerBasedRLEnvCfg):
     """Franka state task starting from the asset's configured home pose."""
 
-    scene: FrankaSceneCfg = FrankaSceneCfg(num_envs=4096, env_spacing=0.9, replicate_physics=True)
+    scene: FrankaSceneCfg = FrankaSceneCfg(num_envs=64, env_spacing=0.9, replicate_physics=True)
     actions: ActionsCfg = ActionsCfg()
     observations: ObservationsCfg = ObservationsCfg()
     events: DefaultEventsCfg = DefaultEventsCfg()

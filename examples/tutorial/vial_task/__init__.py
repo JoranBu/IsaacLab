@@ -3,18 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Register the single state-based vial-placement tutorial task."""
+"""Register the state-based Franka vial-lifting task."""
 
 import gymnasium as gym
 
-TASK_ID = "IsaacTutorial-Place-Vial-SO101"
+TASK_ID = "Vial_Pickup_Task"
 
 gym.register(
     id=TASK_ID,
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.env_cfg:SO101VialEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.env_cfg:ClothEnvCFG",
         "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:SO101StatePPORunnerCfg",
         "default_agent": "rsl_rl",
     },
