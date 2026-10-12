@@ -13,6 +13,7 @@ import warp as wp
 wp.config.enable_backward = False
 
 import vial_task  # noqa: E402
+import cloth_task
 
 from isaaclab_rl.entrypoints import (  # noqa: E402
     run_play_cli,
@@ -25,9 +26,16 @@ from isaaclab_rl.entrypoints import (  # noqa: E402
 def main() -> int:
     """Register the local example and forward arguments to the shared runner."""
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
-    parser.add_argument("command", choices=("zero_agent", "random_agent", "train", "play"))
-    parser.add_argument("--task", choices=(vial_task.TASK_ID,), default=vial_task.TASK_ID)
+    parser.add_argument("command", choices=("zero_agent", "random_agent", "train", "play", "benchmark"))
+    parser.add_argument("--task", choices=(vial_task.TASK_ID, cloth_task.TASK_ID), default=vial_task.TASK_ID)
     args, remaining = parser.parse_known_args()
+    if args.command == "benchmark":
+        from isaaclab.benchmark import run_benchmark_cli
+
+        if not remaining or remaining[0] in ("-h", "--help"):
+            return run_benchmark_cli(remaining)
+        return run_benchmark_cli([remaining[0], "--task", args.task, *remaining[1:]])
+
     runners = {
         "zero_agent": run_zero_agent_cli,
         "random_agent": run_random_agent_cli,

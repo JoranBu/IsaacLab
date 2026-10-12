@@ -7,10 +7,11 @@
 
 Run from the IsaacLab repository root::
 
-    uv run python thesis/cloth_lift.py --viz viser
-    # Open http://localhost:8080. Stop the simulation with Ctrl+C.
+    uv run --extra viser python thesis/cloth_lift.py --viz viser
+    # Open the Viser URL printed in the terminal. Stop with Ctrl+C.
 
     uv run python thesis/cloth_lift.py --viz none --num_steps 1200
+    uv run python thesis/benchmark_cloth_lift.py --runs 3 --num_steps 900
 
 Both the arm and the deformable cloth use Newton's VBD solver. The gripper
 uses physical contact only: no cloth vertices are attached to the fingers.
@@ -23,7 +24,10 @@ Distances are in metres, times in seconds, and quaternions are (x, y, z, w).
 from __future__ import annotations
 
 import argparse
+import json
+import time
 from functools import partial
+from pathlib import Path
 
 import newton
 import torch
@@ -183,7 +187,7 @@ def update_joint_feedback(env: ManagerBasedEnv) -> None:
     newton.eval_ik(physics.get_model(), state, state.joint_q, state.joint_qd)
 
 
-def run_trajectory(env: ManagerBasedEnv, args: argparse.Namespace) -> None:
+def run_trajectory(env: ManagerBasedEnv, args: argparse.Namespace) -> dict:
     """Approach an edge, descend, close, lift, then hold until the user stops."""
     env.reset()
     start_position, start_orientation = fingertip_pose(env)
@@ -192,8 +196,10 @@ def run_trajectory(env: ManagerBasedEnv, args: argparse.Namespace) -> None:
 
     # Aim just inside the near edge. One open finger is outside the cloth, which
     # gives the other finger a chance to gather the edge during closure.
-    #I multiply by 0.9 so I don't grab next to the cloth
-    grasp = torch.tensor([[CLOTH_CENTER[0]-0.8*(CLOTH_SIZE[0]/2), -CLOTH_SIZE[1] / 2 , args.grasp_height]], device=env.device)
+    # Keep X slightly inside the left corner of that edge.
+    grasp = torch.tensor(
+        [[CLOTH_CENTER[0] - 0.5 * (CLOTH_SIZE[0] / 2),CLOTH_CENTER[1] - 0.5 * (CLOTH_SIZE[1] / 2), args.grasp_height]], device=env.device
+    )
     above = grasp.clone()
     above[:, 2] = 0.18
     lifted = grasp.clone()
@@ -214,11 +220,19 @@ def run_trajectory(env: ManagerBasedEnv, args: argparse.Namespace) -> None:
     phase_index = 0
     phase_time = 0.0
     step = 0
-    print("[cloth_lift] Newton/VBD: physical grasp attempt; Ctrl+C to stop.", flush=True)
+    benchmarking = args.benchmark_output is not None
+    measured_start = None
+    print("[cloth_lift] Physical grasp attempt; Ctrl+C to stop.", flush=True)
     print(f"[cloth_lift] Phase: {phases[0][0]}", flush=True)
 
     with torch.inference_mode():
         while env.sim.is_running() and (args.num_steps == 0 or step < args.num_steps):
+            # Exclude initial settling, JIT compilation, and CUDA graph capture.
+            # Synchronize only at the timing boundaries, not on every step.
+            if benchmarking and step == args.warmup_steps:
+                if env.device.startswith("cuda"):
+                    torch.cuda.synchronize(env.device)
+                measured_start = time.perf_counter()
             name, duration, begin, end, fingers = phases[phase_index]
             blend = smoothstep(phase_time / duration)
             action[:, :3] = torch.lerp(begin, end, blend)
@@ -234,19 +248,43 @@ def run_trajectory(env: ManagerBasedEnv, args: argparse.Namespace) -> None:
             phase_time += env.step_dt
 
             if phase_time >= duration:
-                report_state(env, action[:, :3])
+                # Console output and diagnostic GPU reads are excluded from the
+                # benchmark loop. Interactive runs keep the phase reports.
+                if not benchmarking:
+                    report_state(env, action[:, :3])
                 phase_index += 1
                 phase_time = 0.0
-                print(f"[cloth_lift] Phase: {phases[phase_index][0]}", flush=True)
+                if not benchmarking:
+                    print(f"[cloth_lift] Phase: {phases[phase_index][0]}", flush=True)
 
-    report_state(env, action[:, :3])
+    result = {}
+    if benchmarking:
+        if env.device.startswith("cuda"):
+            torch.cuda.synchronize(env.device)
+        if measured_start is None or step != args.num_steps:
+            raise RuntimeError("Benchmark stopped before completing the requested rollout.")
+        elapsed = time.perf_counter() - measured_start
+        measured_steps = step - args.warmup_steps
+        result = {
+            "warmup_steps": args.warmup_steps,
+            "measured_steps": measured_steps,
+            "elapsed_seconds": elapsed,
+            "control_steps_per_second": measured_steps / elapsed,
+            "milliseconds_per_control_step": elapsed * 1000.0 / measured_steps,
+            "real_time_factor": measured_steps * env.step_dt / elapsed,
+            "final_phase": phases[phase_index][0],
+        }
+    result["outcome"] = report_state(env, action[:, :3])
+    return result
 
 
-def report_state(env: ManagerBasedEnv, target: torch.Tensor) -> None:
+def report_state(env: ManagerBasedEnv, target: torch.Tensor) -> dict:
     """Print measured motion; cloth height alone does not prove a stable grasp."""
     positions = env.scene["cloth"].data.nodal_pos_w.torch
     joints = env.scene["robot"].data.joint_pos.torch
-    if not torch.isfinite(positions).all() or not torch.isfinite(joints).all():
+    velocities = env.scene["cloth"].data.nodal_vel_w.torch
+    joint_velocities = env.scene["robot"].data.joint_vel.torch
+    if not all(torch.isfinite(values).all() for values in (positions, velocities, joints, joint_velocities)):
         raise RuntimeError("Non-finite physics state detected; stop and inspect the solver settings.")
     actual_position, _ = fingertip_pose(env)
     error = torch.linalg.vector_norm(actual_position - target).item()
@@ -256,34 +294,97 @@ def report_state(env: ManagerBasedEnv, target: torch.Tensor) -> None:
         f"{positions[..., 2].mean().item():.4f} / {positions[..., 2].max().item():.4f} m",
         flush=True,
     )
+    return {
+        "tip_height_m": actual_position[0, 2].item(),
+        "tip_error_m": error,
+        "cloth_min_height_m": positions[..., 2].min().item(),
+        "cloth_mean_height_m": positions[..., 2].mean().item(),
+        "cloth_max_height_m": positions[..., 2].max().item(),
+        "cloth_fraction_above_3cm": (positions[..., 2] > 0.03).float().mean().item(),
+    }
 
 
-def main() -> None:
+def main(cfg: ClothLiftEnvCfg | None = None, solver_name: str = "vbd", description: str = __doc__) -> None:
     """Parse options, start the simulator, and release resources on exit."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--num_steps", type=int, default=0, help="Control steps to run; 0 holds until Ctrl+C.")
     parser.add_argument("--grasp_height", type=float, default=0.007, help="Fingertip target above the ground [m].")
     parser.add_argument("--lift_height", type=float, default=0.15, help="Vertical motion after closing [m].")
+    parser.add_argument("--benchmark_output", type=Path, help="Write headless rollout timings and final state to JSON.")
+    parser.add_argument(
+        "--warmup_steps", type=int, default=60, help="Untimed initial settling steps when benchmarking."
+    )
     add_launcher_args(parser)
     parser.set_defaults(visualizer=["viser"])
     args = parser.parse_args()
     if args.num_steps < 0 or args.grasp_height < 0.0 or args.lift_height < 0.0:
         parser.error("Step count and heights must be nonnegative.")
+    if args.benchmark_output is not None:
+        if args.num_steps <= args.warmup_steps or not 1 <= args.warmup_steps <= 60:
+            parser.error("Benchmark needs num_steps > warmup_steps, with 1 <= warmup_steps <= 60.")
+        if args.visualizer:
+            parser.error("Use --viz none for benchmarks to exclude visualization costs.")
 
-    cfg = ClothLiftEnvCfg()
+    cfg = ClothLiftEnvCfg() if cfg is None else cfg
     cfg.sim.device = args.device
+    # Capture settings before initialization resolves the proxy selectors to
+    # indices. The comparison runner checks that shared settings match exactly.
+    experiment_configuration = {
+        "scene": cfg.scene.to_dict(),
+        "actions": cfg.actions.to_dict(),
+        "observations": cfg.observations.to_dict(),
+        "seed": cfg.seed,
+        "physics_dt": cfg.sim.dt,
+        "decimation": cfg.decimation,
+        "substeps": cfg.sim.physics.num_substeps,
+        "soft_contact": cfg.sim.physics.soft_contact_cfg.to_dict(),
+        "grasp_height": args.grasp_height,
+        "lift_height": args.lift_height,
+    }
+    physics_configuration = cfg.sim.physics.to_dict()
+    setup_start = time.perf_counter()
+    print(f"[cloth_lift] Solver: {solver_name}", flush=True)
     with launch_simulation(cfg, args):
         env = ManagerBasedEnv(cfg=cfg)
+        setup_seconds = time.perf_counter() - setup_start
         # Register before the first step so CUDA graph capture includes the
         # feedback update and the IK controller sees live joints every tick.
-        joint_feedback = partial(update_joint_feedback, env)
-        env.sim.physics_manager.register_post_step_callback(joint_feedback)
+        # MJWarp already writes live joint coordinates. Only the all-VBD
+        # version needs reconstruction from the simulated body poses.
+        joint_feedback = None
+        if isinstance(cfg.sim.physics.solver_cfg, VBDSolverCfg):
+            joint_feedback = partial(update_joint_feedback, env)
+            env.sim.physics_manager.register_post_step_callback(joint_feedback)
         try:
-            run_trajectory(env, args)
+            result = run_trajectory(env, args)
+            if args.benchmark_output is not None:
+                result.update(
+                    {
+                        "solver": solver_name,
+                        "device": str(env.device),
+                        "gpu": torch.cuda.get_device_name(env.device) if env.device.startswith("cuda") else None,
+                        "setup_seconds": setup_seconds,
+                        "total_steps": args.num_steps,
+                        "seed": cfg.seed,
+                        "num_envs": cfg.scene.num_envs,
+                        "physics_dt": cfg.sim.dt,
+                        "decimation": cfg.decimation,
+                        "substeps": cfg.sim.physics.num_substeps,
+                        "grasp_height_m": args.grasp_height,
+                        "lift_height_m": args.lift_height,
+                        "cloth_particles": env.scene["cloth"].data.nodal_pos_w.shape[1],
+                        "experiment_configuration": experiment_configuration,
+                        "physics_configuration": physics_configuration,
+                    }
+                )
+                args.benchmark_output.parent.mkdir(parents=True, exist_ok=True)
+                args.benchmark_output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+                print(f"[cloth_lift] Benchmark saved to {args.benchmark_output}", flush=True)
         except KeyboardInterrupt:
             print("\n[cloth_lift] Stopped.")
         finally:
-            env.sim.physics_manager.unregister_post_step_callback(joint_feedback)
+            if joint_feedback is not None:
+                env.sim.physics_manager.unregister_post_step_callback(joint_feedback)
             env.close()
 
 

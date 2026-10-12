@@ -296,7 +296,7 @@ class PhysicsCfg(PresetCfg):
             impratio=10.0,
             update_data_interval=2,
             iterations=100,
-            ls_iterations=15,
+            ls_iterations=50, #used to be 15, but gave many warnings
             use_mujoco_contacts=False,
             ccd_iterations=35,
         ),

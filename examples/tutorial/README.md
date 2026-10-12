@@ -48,6 +48,32 @@ uv run --extra viser python run.py zero_agent --num_envs 1 --viz viser
 Training writes to `logs/rsl_rl/so101_vial_state/`. A smoke checkpoint proves
 that the runner works; it has not learned the complete pick-and-place task.
 
+## Benchmark
+
+From this folder, measure environment throughput using Isaac Lab's shared
+runtime benchmark with random actions:
+
+```bash
+uv run --no-sync python run.py benchmark runtime \
+  --num_envs 128 --viz none --num_steps 1000 --warmup_steps 100 \
+  --seed 42 --output_path logs/benchmarks/128
+```
+
+Warmup steps run before the 1,000 measured control steps to exclude first-use
+compilation and initialization. The report shows aggregate environment
+transitions per second, control-step timing, and resource usage, and writes
+a JSON report under `logs/benchmarks/128`. Each control step advances all
+parallel environments; aggregate throughput scales with their count.
+Automatic resets are included. This measures runtime performance; task success
+requires a separate evaluation of a trained policy.
+
+Repeat with `--num_envs 32`, `128`, `512`, or `1024`, using a different output
+folder for each run, to compare scaling on your GPU. Keep the viewer disabled
+for physics and environment throughput; use `--viz viser` to measure the
+additional viewer cost. Use `python run.py benchmark runtime --help` through
+uv for all options. The launcher also forwards the shared `startup`,
+`training`, and `play` benchmark workflows.
+
 ## Task and resets
 
 The policy has six actions: five measured-relative arm joint increments scaled
