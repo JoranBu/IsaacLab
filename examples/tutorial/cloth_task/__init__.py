@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Register the single state-based vial-placement tutorial task."""
+"""Register the state-based Franka vial-lifting task."""
 
 import gymnasium as gym
 

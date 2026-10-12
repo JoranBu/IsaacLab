@@ -29,7 +29,7 @@ class ViserVisualizerCfg(VisualizerCfg):
     cloning_contexts: tuple[type | str, ...] = ("isaaclab_newton.cloner:NewtonReplicateContext",)
 
     port: int = 8080
-    port: int = 8088
+    port: int = 8089
     """Port of the local viser web server."""
 
     bind_address: str = "0.0.0.0"

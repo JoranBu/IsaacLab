@@ -1,7 +1,29 @@
 # Franka robot configuration
 
-This task currently keeps the vial and rack from the SO-101 tutorial. Its robot
-and live policy inputs use Franka Panda; adding cloth is a separate change.
+This task uses Franka Panda to grasp and lift the tutorial vial from a collision
+mat. Adding cloth is a separate change.
+
+## Lift objective
+
+Success requires a live bilateral finger grasp with the vial's **lowest point
+at least 0.10 m above the mat for ten consecutive control steps** (about 0.33 s).
+The vial can have any orientation. `terms.py` computes the lowest point from
+the vial's axis and cylinder dimensions, so rotating the vial cannot satisfy
+the goal just by moving its root upward.
+
+- Approach shaping rewards decreasing fingertip-to-vial grasp-point distance.
+- Dense lift shaping rewards live bilateral contact in proportion to clearance,
+  capped at the success height. A released or airborne vial gets no lift reward.
+- Grasp and lift milestones pay once per episode; sustained lift gives the
+  success bonus and terminates the episode.
+- Invalid/unreachable vial states, a return to the mat after the lift milestone,
+  extreme joint motion, and timeout remain termination conditions.
+- The actor observes clearance, jaw opening, normalized grasp/hold counters,
+  and two latched progress flags. The critic additionally observes finger contacts.
+
+The old insertion/placement observations, rewards, metrics, reset generator,
+and dataset were removed. Resets use the configured robot and vial defaults.
+The original placement workflow is available in `../vial_task/`.
 
 ## When changing robots
 
@@ -24,15 +46,13 @@ or reset states. Check each of them:
   Both finger states are observed, but the gripper action commands finger 1.
   Arm positions are radians; finger positions are metres.
 - `DefaultEventsCfg.reset_scene` restores the asset's `init_state` and drive
-  targets. The copied `reset_poses.npz` and `generator.py` are SO-101-specific
-  and are not used by the Franka task. Port the generator and dataset schema
-  before enabling dataset replay; six SO-101 coordinates cannot be mapped to
-  nine Franka coordinates by renaming them.
+  targets. Robot-specific reset data must match the robot's joint names, order,
+  and task objective before it can replace the default reset.
 - `terms.py` uses Panda finger bodies and a 0.046 m local-Z fingertip offset.
   Both finger contact sensors filter contacts against the vial.
 
-The observation shape and action meaning changed, so train a new policy rather
-than resuming an SO-101 checkpoint. `agent_cfg.py` uses `cloth_franka_state` as
+The observation shape changed when placement was removed, so train a new policy.
+`agent_cfg.py` uses `cloth_franka_lift` as
 the experiment name to keep new runs separate from the original tutorial.
 
 ## Sources in this checkout
@@ -61,4 +81,4 @@ uv run --no-sync python examples/tutorial/run.py random_agent \
 ```
 
 Random actions only check that the environment can step. They do not validate
-reachability or successful vial placement.
+reachability or successful lifting.

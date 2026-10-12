@@ -43,7 +43,7 @@ class SO101StatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 64
     max_iterations = 800
     save_interval = 50
-    experiment_name = "cloth_franka_state"
+    experiment_name = "cloth_franka_lift"
     run_name = ""
     obs_groups = {"actor": ["policy"], "critic": ["critic"]}
     clip_actions = 1.0

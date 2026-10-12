@@ -5,12 +5,9 @@
 
 # Adapted from isaac-sim/IsaacLabTutorial (Apache-2.0); see ../LICENSE-IsaacLabTutorial.
 
-"""Manager-based Franka task adapted from the vial-placement tutorial."""
+"""Manager-based Franka vial-lifting task."""
 
 from __future__ import annotations
-
-import math
-from pathlib import Path
 
 import newton
 from isaaclab_newton.physics import (
@@ -46,14 +43,7 @@ from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG
 from . import terms
 
 ASSET_DIR = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Vial_Rack"
-RESET_DATASET = Path(__file__).with_name("reset_poses.npz")
-CANONICAL_START = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-ALL_PHASES = (1.0,) * 8
 TABLETOP_VIAL_POSITION = (0.231, -0.017, 0.06)
-TABLETOP_VIAL_HEADING_RANGE = (-0.35, 0.35)
-PREGRASP_GRIPPER_POSITION = math.radians(-10.0 + 1.1 * 22.4)
-GRASP_GRIPPER_POSITION = math.radians(-10.0 + 1.1 * 1.0)
-RELEASE_GRIPPER_POSITION = math.radians(-10.0 + 1.1 * 42.7)
 ARM_JOINTS = [f"panda_joint{index}" for index in range(1, 8)]
 FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
 # Keep positions, velocities, and drive targets in the same explicit policy order.
@@ -116,7 +106,7 @@ _register_contact_model()
 
 @configclass
 class FrankaSceneCfg(InteractiveSceneCfg):
-    """One Franka, one vial, one rack, and a collision mat."""
+    """One Franka, one vial, and a collision mat."""
 
     robot: ArticulationCfg = replace(FRANKA_PANDA_HIGH_PD_CFG, prim_path="{ENV_REGEX_NS}/Robot")
 
@@ -135,12 +125,6 @@ class FrankaSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    rack = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Rack",
-        spawn=sim_utils.UsdFileCfg(usd_path=f"{ASSET_DIR}/rack.usda"),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.18, 0.08, 0.04)),
-    )
-
     mat = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Mat",
         spawn=sim_utils.UsdFileCfg(usd_path=f"{ASSET_DIR}/mat.usda"),
@@ -148,12 +132,6 @@ class FrankaSceneCfg(InteractiveSceneCfg):
             pos=(0.22, 0.0, 0.032),
             rot=(0.0, 0.0, 0.7071068, 0.7071068),
         ),
-    )
-
-    vial_rack_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Vial",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Rack"],
-        history_length=4,
     )
 
     fixed_jaw_contact = ContactSensorCfg(
@@ -213,8 +191,7 @@ class PolicyStateGroupCfg(ObsGroup):
         func=terms.body_state, params={"asset_cfg": SceneEntityCfg("robot", body_names="panda_hand")}
     )
     vial = ObsTerm(func=terms.rigid_object_state, params={"asset_cfg": SceneEntityCfg("vial")})
-    rack_target = ObsTerm(func=terms.rack_relative_target)
-    placement = ObsTerm(func=terms.placement_features)
+    lift = ObsTerm(func=terms.lift_features)
     # Latched milestones make the once-per-episode milestone rewards Markov.
     progress = ObsTerm(func=terms.progress_flags)
 
@@ -262,7 +239,6 @@ class DefaultEventsCfg:
         },
     )
     reset_scene = EventTerm(
-        # The copied dataset contains six SO-101 joints, not nine Franka joints.
         func=mdp.reset_scene_to_default,
         mode="reset",
         params={"reset_joint_targets": True},
@@ -271,10 +247,10 @@ class DefaultEventsCfg:
 
 @configclass
 class RewardsCfg:
-    """Sparse physical milestones, a success bonus, two dense shaping terms, and light regularization."""
+    """Approach and lift shaping, grasp/lift milestones, success, and light regularization."""
 
     approach_progress = RewTerm(func=terms.ApproachProgressReward, weight=1.0)
-    held_goal = RewTerm(func=terms.held_goal_reward, weight=0.1)
+    lift = RewTerm(func=terms.lift_reward, weight=0.1)
     milestones = RewTerm(func=terms.PhysicalMilestoneReward, weight=10.0)
     success = RewTerm(func=terms.success_bonus, weight=200.0)
     vial_lost = RewTerm(func=terms.vial_lost, weight=-50.0)
@@ -284,7 +260,7 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    success = DoneTerm(func=terms.PlacementHistoryTerm)
+    success = DoneTerm(func=terms.LiftHistoryTerm)
     vial_lost = DoneTerm(func=terms.vial_lost)
     unstable_robot = DoneTerm(func=terms.unstable_robot)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
@@ -337,27 +313,3 @@ class ClothEnvCFG(ManagerBasedRLEnvCfg):
         """Play complete episodes from the Franka home pose."""
         super().play_mode()
         self.scene.num_envs = min(self.scene.num_envs, 16)
-
-
-@configclass
-class GeneratorEventsCfg:
-    """Give the generator a fixed 20 g vial; it initializes candidate poses explicitly."""
-
-    vial_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("vial"),
-            "mass_distribution_params": (0.02, 0.02),
-            "operation": "abs",
-        },
-    )
-
-
-@configclass
-class SO101VialGeneratorEnvCfg(ClothEnvCFG):
-    """Reuse the task scene and physics for directly commanded candidate rollouts."""
-
-    events: GeneratorEventsCfg = GeneratorEventsCfg()
-    rewards = None
-    terminations = None
