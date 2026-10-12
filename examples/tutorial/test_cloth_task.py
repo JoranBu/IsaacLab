@@ -5,19 +5,20 @@
 
 """Cloth lift geometry, progress, reset, and coupled-simulation regression checks."""
 
+import pytest
 import torch
 import warp as wp
 
 wp.config.enable_backward = False
 
-from cloth_task import terms  # noqa: E402
+from cloth_task import resets, terms  # noqa: E402
 from cloth_task.env_cfg import FINGER_JOINTS, ClothEnvCFG  # noqa: E402
 
 from isaaclab.app import launch_simulation  # noqa: E402
 from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
 
 
-def test_cloth_lift_and_partial_reset():
+def test_cloth_lift_and_partial_reset(tmp_path):
     """Require the whole sheet to lift, expose cloth motion, and reset only selected episodes."""
     cfg = ClothEnvCFG()
     cfg.scene.num_envs = 2
@@ -133,5 +134,33 @@ def test_cloth_lift_and_partial_reset():
             # The cloth must actually advance under gravity and settle on the support surface.
             assert (terms.cloth_height(env) < initial_height).all()
             assert (terms.cloth_clearance(env) > -0.01).all()
+
+            # The reset archive must replay nodal geometry in the destination
+            # world, release any support, and preserve unrelated environments.
+            snapshot = {key: value[:1] for key, value in resets.capture_state(env, phase=0).items()}
+            path = tmp_path / "cloth_resets.npz"
+            resets.save_dataset(path, env, snapshot, metadata={"validation": "integration"})
+            original_bytes = path.read_bytes()
+            invalid = {**snapshot, "cloth_nodal_state": snapshot["cloth_nodal_state"].clone()}
+            invalid["cloth_nodal_state"][0, 0, 0] = float("nan")
+            with pytest.raises(ValueError, match="cloth_nodal_state"):
+                resets.save_dataset(path, env, invalid, metadata={})
+            assert path.read_bytes() == original_bytes
+
+            event = env.event_manager.get_term_cfg("reset_from_dataset")
+            event.params["dataset_path"] = str(path)
+            event.params["phase_weights"] = (1.0, 0.0, 0.0, 0.0)
+            event.func = resets.ResetFromDataset(event, env)
+            env.event_manager.set_term_cfg("reset_from_dataset", event)
+            preserved_nodes = cloth.data.nodal_state_w.torch[0].clone()
+            preserved_joints = robot.data.joint_pos.torch[0].clone()
+            env.reset(env_ids=torch.tensor([1], device=env.device))
+            expected = snapshot["cloth_nodal_state"][0].clone()
+            expected[:, :3] += env.scene.env_origins[1]
+            torch.testing.assert_close(cloth.data.nodal_state_w.torch[1], expected)
+            torch.testing.assert_close(cloth.data.nodal_state_w.torch[0], preserved_nodes)
+            torch.testing.assert_close(robot.data.joint_pos.torch[0], preserved_joints)
+            torch.testing.assert_close(robot.actuators.target_command.position.torch[1], snapshot["joint_target"][0])
+            assert (cloth.data.nodal_kinematic_target.torch[1, :, 3] == 1).all()
         finally:
             env.close()

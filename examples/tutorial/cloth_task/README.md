@@ -126,3 +126,26 @@ uv run --no-sync --with pytest python -m pytest examples/tutorial/test_vial_task
 - [Franka asset](../../../source/isaaclab_assets/isaaclab_assets/robots/franka.py): joint ordering,
   actuators, mimic finger, and collider variants.
 - [Manager-based RL environment guide](../../../docs/source/how-to/create_manager_rl_env.rst).
+
+## Reset generator work in progress
+
+`generator.py` and `resets.py` preserve the interrupted OmniReset-inspired work.
+The proposed banks are reaching, near-corner, grasped, and near-goal. The generator
+constructs flat-lift proposals, pre-drapes the sheet, removes its assistance, and
+checks normal-physics replay before saving full nodal and robot states.
+
+**Status:** grasped and near-goal banks have not passed replay validation; this
+is unfinished work, not a ready-to-use reset dataset. No valid complete archive
+has been produced. The cloth-specific contact stiffness/damping and 2 mm closed
+finger target in `env_cfg.py` are experimental adjustments from that work.
+
+The dataset reset event is disabled by default (`dataset_path=None`). The existing
+home-pose reset remains active. A working archive can later be enabled through
+`env.events.reset_from_dataset.params.dataset_path=/absolute/path/to/archive.npz`.
+
+The script's options and generation-only table-penetration allowance are documented
+in its module docstring and `--help`:
+
+```bash
+uv run --no-sync python -m examples.tutorial.cloth_task.generator --help
+```

@@ -49,6 +49,7 @@ from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG
 
 from . import terms
 from .actions import BoundedDifferentialIKActionCfg
+from .resets import ResetFromDataset
 
 ASSET_DIR = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Vial_Rack"  # Tabletop assets shared with the vial task.
 TABLETOP_CLOTH_POSITION = (0.231, -0.017, terms.MAT_TOP_HEIGHT + terms.CLOTH_PARTICLE_RADIUS + 0.001)
@@ -59,8 +60,10 @@ FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
 JOINTS = ARM_JOINTS + FINGER_JOINTS
 
 
-_CONTACT_STIFFNESS = 1.57e5
-_CONTACT_DAMPING = 1.12e3
+# VBD mixes particle-side and shape-side material values. The vial's
+# 157 kN/m / 1120 Ns/m contact model makes thin-sheet pinches unstable.
+_CONTACT_STIFFNESS = 8.0e3
+_CONTACT_DAMPING = 0.01
 _FRICTION = 0.7
 _ROLLING_FRICTION = 0.05
 _TORSIONAL_FRICTION = 0.005
@@ -72,10 +75,14 @@ TCP_OFFSET = (0.0, 0.0, 0.107)  # From panda_hand to the point between the finge
 
 
 def _initialize_contacts(_event: PhysicsEvent) -> None:
-    """Apply the workshop-validated contact model to every Newton shape."""
+    """Apply cloth contact settings without changing the rigid-only vial scene."""
     sim = SimulationContext.instance()
     builder = sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=sim.cfg.physics))
 
+    # run.py registers both local tasks. Keep this callback harmless when the
+    # selected scene is the rigid-only vial task.
+    if not builder.particle_q:
+        return
     num_shapes = len(builder.shape_body)
     for shape_index in range(num_shapes):
         builder.shape_material_ke[shape_index] = _CONTACT_STIFFNESS
@@ -105,7 +112,7 @@ def _register_contact_model() -> None:
     NewtonManager.register_callback(
         _initialize_contacts,
         PhysicsEvent.MODEL_INIT,
-        name="so101_workshop_contact_model",
+        name="cloth_task_contact_model",
     )
     _contact_model_registered = True
 
@@ -203,7 +210,9 @@ class ActionsCfg:
         # The flat Franka asset drives finger 1; finger 2 follows its mimic constraint.
         joint_names=[FINGER_JOINTS[0]],
         open_command_expr={FINGER_JOINTS[0]: 0.04},
-        close_command_expr={FINGER_JOINTS[0]: 0.0},
+        # Leave a 4 mm jaw aperture for 6 mm particle collision thickness,
+        # rather than crushing both pads through the same cloth vertices.
+        close_command_expr={FINGER_JOINTS[0]: 0.002},
     )
 
 
@@ -255,6 +264,12 @@ class DefaultEventsCfg:
         func=mdp.reset_scene_to_default,
         mode="reset",
         params={"reset_joint_targets": True},
+    )
+    reset_from_dataset = EventTerm(
+        func=ResetFromDataset,
+        mode="reset",
+        # Opt in through the CLI; the ordinary home-pose reset remains the default.
+        params={"dataset_path": None, "phase_weights": None},
     )
 
 
