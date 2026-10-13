@@ -324,9 +324,6 @@ class PhysicsCfg(PresetCfg):
                     name="cloth",
                     solver_cfg=VBDSolverCfg(
                         iterations=20,
-                        # The 1 cm/s default smoothing lets a loaded corner
-                        # creep out of the pads while the flat sheet drapes.
-                        friction_epsilon=1.0e-4,
                         rigid_body_particle_contact_buffer_size=1024,
                         particle_enable_self_contact=True,
                         particle_self_contact_radius=terms.CLOTH_PARTICLE_RADIUS,
