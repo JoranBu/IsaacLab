@@ -229,15 +229,32 @@ when changing cloth refinement, placement, materials, robot, or physics.
 
 ## Train with the reset bank
 
-The dataset event is disabled by default. Enable it with an absolute path, from
-the **repository root**:
+The dataset event is enabled by default. `RESET_DATASET_PATH` in `env_cfg.py`
+points to `logs/cloth_table_resets.npz` under the checkout, independently of the
+current working directory. Startup logs report the loaded archive and bank counts.
+The archive must exist; use the generator to create it when setting up another
+checkout. The generator disables automatic sampling while constructing or viewing
+its own states.
+
+Train from the **repository root**:
 
 ```bash
 uv run --no-sync python examples/tutorial/run.py train \
-  --task Adapted_Cloth_Task --num_envs 64 --device cuda:0 \
-  --max_iterations 800 --run_name cloth_diverse_resets \
-  env.events.reset_from_dataset.params.dataset_path="$PWD/logs/cloth_table_resets.npz"
+  --task Adapted_Cloth_Task --resets uniform --num_envs 64 --device cuda:0 \
+  --max_iterations 800 --run_name cloth_diverse_resets
 ```
+
+`run.py` accepts `--resets uniform` to sample uniformly from the fixed archive,
+or `--resets none` to start with the robot at its home pose and the cloth flat on
+the table. The option works for training, playback, zero/random agents, and
+benchmarks of the cloth task. Omitting it keeps the task configuration's default
+(currently uniform archive sampling). `uniform` also clears explicit phase
+weights; rows are equally likely, so larger banks are sampled more often.
+
+To use another bank, override
+`env.events.reset_from_dataset.params.dataset_path=/absolute/path/to/archive.npz`
+without `--resets`. An explicit `--resets` selection takes precedence over raw
+reset overrides.
 
 The archive is cached on the environment device once; each episode samples a row.
 Equal bank quotas give equal bank probabilities with the default uniform row
@@ -249,8 +266,9 @@ sampling. Optional explicit bank weights follow the table's order:
 ```
 
 A partial episode reset only restores the selected environments. Reward history
-starts fresh, including for already held cloth. The policy controls the next
-command; it must keep the gripper action negative to retain a grasped reset.
+starts fresh, including for already held cloth. The saved open/closed gripper command is restored after action history resets,
+so the first observation correctly identifies a held state. The policy controls
+the next command; it must keep the gripper action negative to retain that grasp.
 Passing generation/replay checks establishes usable initial states, not that PPO
 has learned the complete task.
 

@@ -20,6 +20,7 @@ from isaaclab.envs import ManagerBasedEnv  # noqa: E402
 def test_generated_banks_survive_reset_and_relocation(tmp_path):
     """Generate supported and airborne grasps and retain both after restoring saved rows."""
     cfg = ClothEnvCFG()
+    cfg.events.reset_from_dataset.params["dataset_path"] = None
     cfg.scene.num_envs = 4
     cfg.seed = 42
     # The offline generator uses the base environment so reward milestones

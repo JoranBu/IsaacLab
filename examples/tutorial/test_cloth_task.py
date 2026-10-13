@@ -21,6 +21,8 @@ from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
 def test_cloth_lift_and_partial_reset(tmp_path):
     """Require the whole sheet to lift, expose cloth motion, and reset only selected episodes."""
     cfg = ClothEnvCFG()
+    # This fixture exercises the ordinary reset and builds its own archive.
+    cfg.events.reset_from_dataset.params["dataset_path"] = None
     cfg.scene.num_envs = 2
     cfg.seed = 42
     with launch_simulation(cfg, {"visualizer": ["none"]}) as physics_cfg:
@@ -100,6 +102,9 @@ def test_cloth_lift_and_partial_reset(tmp_path):
                 assert not history_term(env).any()
             assert history_term(env).all()
             assert terms.progress_flags(env).bool().all()
+            # Keep a closed-jaw snapshot to test reset observations later.
+            env.action_manager.apply_action()
+            grasp_snapshot = {key: value[:1] for key, value in resets.capture_state(env, phase=2).items()}
 
             # Released cloth cannot earn dense lift reward, even while still airborne.
             action[:, -1] = 1.0
@@ -137,7 +142,7 @@ def test_cloth_lift_and_partial_reset(tmp_path):
 
             # The reset archive must replay nodal geometry in the destination
             # world, release any support, and preserve unrelated environments.
-            snapshot = {key: value[:1] for key, value in resets.capture_state(env, phase=0).items()}
+            snapshot = grasp_snapshot
             path = tmp_path / "cloth_resets.npz"
             resets.save_dataset(path, env, snapshot, metadata={"validation": "integration"})
             original_bytes = path.read_bytes()
@@ -149,11 +154,13 @@ def test_cloth_lift_and_partial_reset(tmp_path):
 
             event = env.event_manager.get_term_cfg("reset_from_dataset")
             event.params["dataset_path"] = str(path)
-            event.params["phase_weights"] = (1.0, 0.0, 0.0, 0.0)
+            event.params["phase_weights"] = (0.0, 0.0, 1.0, 0.0)
             event.func = resets.ResetFromDataset(event, env)
             env.event_manager.set_term_cfg("reset_from_dataset", event)
             preserved_nodes = cloth.data.nodal_state_w.torch[0].clone()
             preserved_joints = robot.data.joint_pos.torch[0].clone()
+            preserved_action = env.action_manager.action[0].clone()
+            preserved_previous_action = env.action_manager.prev_action[0].clone()
             env.reset(env_ids=torch.tensor([1], device=env.device))
             expected = snapshot["cloth_nodal_state"][0].clone()
             expected[:, :3] += env.scene.env_origins[1]
@@ -162,5 +169,11 @@ def test_cloth_lift_and_partial_reset(tmp_path):
             torch.testing.assert_close(robot.data.joint_pos.torch[0], preserved_joints)
             torch.testing.assert_close(robot.actuators.target_command.position.torch[1], snapshot["joint_target"][0])
             assert (cloth.data.nodal_kinematic_target.torch[1, :, 3] == 1).all()
+            assert env.action_manager.action[1, -1] == -1
+            assert env.action_manager.prev_action[1, -1] == -1
+            assert terms.bilateral_contact(env)[1]
+            assert not terms.progress_flags(env)[1].any()
+            torch.testing.assert_close(env.action_manager.action[0], preserved_action)
+            torch.testing.assert_close(env.action_manager.prev_action[0], preserved_previous_action)
         finally:
             env.close()

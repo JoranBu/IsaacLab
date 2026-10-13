@@ -34,6 +34,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.paths import ISAACLAB_ROOT
 from isaaclab.physics import PhysicsEvent
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
@@ -54,6 +55,8 @@ from .resets import ResetFromDataset
 ASSET_DIR = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Vial_Rack"  # Tabletop assets shared with the vial task.
 TABLETOP_CLOTH_POSITION = (0.231, -0.017, terms.MAT_TOP_HEIGHT + terms.CLOTH_PARTICLE_RADIUS + 0.001)
 CLOTH_SIZE = (0.24, 0.24)
+# Resolve from the checkout, so launching from examples/tutorial also works.
+RESET_DATASET_PATH = str(ISAACLAB_ROOT / "logs" / "cloth_table_resets.npz")
 ARM_JOINTS = [f"panda_joint{index}" for index in range(1, 8)]
 FINGER_JOINTS = ["panda_finger_joint1", "panda_finger_joint2"]
 # Keep positions, velocities, and drive targets in the same explicit policy order.
@@ -272,8 +275,8 @@ class DefaultEventsCfg:
     reset_from_dataset = EventTerm(
         func=ResetFromDataset,
         mode="reset",
-        # Opt in through the CLI; the ordinary home-pose reset remains the default.
-        params={"dataset_path": None, "phase_weights": None},
+        # The default reset runs first, then this restores a sampled snapshot.
+        params={"dataset_path": RESET_DATASET_PATH, "phase_weights": None},
     )
 
 

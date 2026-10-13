@@ -147,17 +147,23 @@ def apply_states(
 
 
 class ResetFromDataset(ManagerTermBase):
-    """Optional reset event: cache snapshots once, then sample rows on GPU.
+    """Cache snapshots once, then sample rows on GPU during episode resets.
 
     The normal default reset runs first. With ``dataset_path=None`` this is a
     no-op. Episode counters and latched rewards are reset by the usual managers;
     sampled physical grasps do not pre-award milestones or mark an episode successful.
+    Restore the gripper command in the reset hook, after the action manager
+    clears history, so the first observation describes the sampled grasp.
     """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         path = cfg.params["dataset_path"]
         self.states = None if path is None else load_dataset(path, env)
+        self._sampled_rows = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+        if self.states is not None:
+            counts = torch.bincount(self.states["phase"].long(), minlength=len(PHASE_NAMES)).tolist()
+            print(f"[INFO]: Loaded cloth reset bank {path}: {len(self.states['phase'])} states; phase counts {counts}")
         self.probabilities = None
         weights = cfg.params["phase_weights"]
         if self.states is not None and weights is not None:
@@ -186,3 +192,24 @@ class ResetFromDataset(ManagerTermBase):
         else:
             rows = torch.multinomial(self.probabilities, len(ids), replacement=True)
         apply_states(env, self.states, rows, ids)
+        self._sampled_rows[ids] = rows
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        """Restore selected gripper commands after action history has been cleared.
+
+        Physical drive targets were already restored in the reset event. Arm
+        history remains zero because those commands are relative increments.
+        Episode milestones remain under the reward/termination managers.
+        """
+        if self.states is None:
+            return
+        ids = torch.arange(self.num_envs, device=self.device)
+        if env_ids is not None:
+            ids = ids[env_ids]
+        rows = self._sampled_rows[ids]
+        ids, rows = ids[rows >= 0], rows[rows >= 0]
+        command = self.states["gripper_command"][rows, 0]
+        self._env.action_manager.action[ids, -1] = command
+        self._env.action_manager.prev_action[ids, -1] = command
+        self._env.action_manager.get_term("gripper").raw_actions[ids, 0] = command
+        self._sampled_rows[ids] = -1

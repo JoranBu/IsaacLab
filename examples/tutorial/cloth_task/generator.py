@@ -493,6 +493,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.view and args.output.suffix != ".npz":
         parser.error("output must use the .npz extension")
     cfg = ClothEnvCFG()
+    # Generation starts from the table; archive viewing restores rows itself.
+    # Neither should sample the training bank during env.reset(). This also
+    # allows generating the first archive when no dataset exists yet.
+    cfg.events.reset_from_dataset.params["dataset_path"] = None
     cfg.scene.num_envs = 1 if args.view else args.num_envs
     cfg.seed = args.seed
     if not args.view:
