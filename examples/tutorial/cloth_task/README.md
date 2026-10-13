@@ -144,65 +144,81 @@ contain physical snapshots rather than demonstration trajectories.
 | --- | --- |
 | `reaching` | Open jaws, roughly 12–27 cm above the selected corner |
 | `near_corner` | Open jaws, 12–45 mm above the corner with small XY offsets |
-| `grasped` | Closed jaws holding the corner; whole-sheet clearance sampled at 25–55 mm |
-| `near_goal` | Closed jaws holding the corner; whole-sheet clearance sampled at 75–95 mm, below the 100 mm success threshold |
+| `grasped` | Closed jaws holding a folded corner patch; half the bank retains table support, half targets 25–55 mm whole-sheet clearance |
+| `near_goal` | Closed jaws holding a corner patch; whole-sheet clearance sampled at 82–92 mm, below the 100 mm success threshold |
 
 Every proposal randomizes the flat sheet's XY position and yaw. The same material
-corner selected in `terms.py` remains the target. The saved clearance can differ
+corner selected in `terms.py` defines the pickup region. The saved clearance can differ
 slightly from its sampled value because the cloth continues settling.
 
-For the held banks, the script uses the policy's bounded IK controller to place
-the jaws around the corner, then lifts **all vertices flat** along a vertical path.
-During this construction it explicitly prescribes nodal positions; this is the
-only assistance. It aligns the supported corner with the measured pad centre,
-closes the jaws, and releases the entire sheet. Normal physics then drapes the
-cloth for two seconds. The settled robot and mesh are moved together into the
-bank's clearance region. IK, construction, settling, and validation are separate
-functions with comments in `generator.py`.
+For the held banks, the script starts with the free sheet on the table and
+constructs an open-jaw hover pose with offline IK. It then descends through real
+simulation, closes the jaws, and raises the arm using the normal policy action
+interface. **Every cloth vertex stays dynamic throughout the pickup.** Direct
+joint and mesh writes are limited to initial pose/flat-sheet initialization and
+archive reset; the pickup never prescribes cloth motion or attaches vertices.
 
-Each candidate must pass 20 control steps (0.67 s) with free vertices, normal
+The grasp centre is sampled slightly inside the selected corner. Closing the
+jaws can gather neighbouring vertices and produce a small fold. A grasp need
+not contain only the exact corner vertex. The generator first raises the patch
+a modest distance and lets it settle. For airborne and near-goal candidates,
+it continues raising the arm while measuring the lowest cloth vertex's clearance.
+It never translates the settled mesh to obtain the desired clearance.
+
+By default, `--partial_grasp_fraction 0.5` reserves half the grasped bank for
+**table-supported** states, rounded up. A supported candidate must have at least
+10% of its vertices within 2 mm of the tabletop support height while a pinched
+patch is more than 6 mm above the mat. Its support must persist through physics
+validation and reset replay. These are geometric checks backed by simulated
+stability, rather than measured table contact forces. The remaining grasped rows
+must clear the table by more than 2 mm. Both categories use the existing `grasped`
+phase label, so the archive format and training reset event remain compatible.
+A quota of one produces one supported grasp; use two or more to obtain both kinds.
+
+Each candidate must pass 30 control steps (1 s) with free vertices, normal
 gravity, table collision, and ordinary pose-holding actions. Checks reject
-non-finite/lost states, unstable robot motion, slipping corners, lost pinches,
-and incorrect final clearance. The generator then resets the environment,
-restores the proposed snapshot, and repeats the proof. Only rows passing both
-checks are saved. The progress output distinguishes proposed, constructed, and
-replay-passing candidates. A failed quota leaves an existing archive intact.
+non-finite/lost states, unstable robot motion, escaping material in the held
+patch, lost pinches, and incorrect final clearance. Validation tracks a material
+vertex near the jaws, allowing the ungripped outer corner to move as the sheet
+folds. The generator then resets the environment, restores the exact snapshot,
+and repeats the proof, including its table-supported/airborne category. Only
+passing rows are saved. Failed quotas leave an existing archive intact.
 
 The generator uses `ManagerBasedEnv`, so success/failure rewards cannot reset a
-proposal midway through construction. Training continues to use the usual RL
-environment. `--table_penetration` permits up to 10 mm of extra downward IK reach
-**only during generation**; it neither removes table collision nor persists in
-snapshots. The default is zero. The final proof uses the normal workspace bounds.
-No vertex attachments, support flags, solver warm-start data, or reward milestones
-are saved. Real joint and nodal velocities are retained, so replay restores the
-physical state rather than silently turning a moving sheet into a static one.
+proposal during pickup. Training uses the usual RL environment.
+`--table_penetration` permits up to 10 mm of extra downward commanded reach
+**only during generation**, while table collision stays enabled. The default is
+zero and the validated saved hand pose must be inside the normal workspace.
+No vertex attachments, constrained support flags, solver warm-start data, or
+reward milestones are saved. Actual joint and nodal velocities are retained.
 
 From the **repository root**:
 
 ```bash
-# Small bank to inspect first: four accepted states per region.
+# Four accepted states per bank; grasped includes two supported and two airborne.
 uv run --no-sync python -m examples.tutorial.cloth_task.generator \
-  --poses_per_phase 4 --num_envs 4 --seed 42 \
-  --output logs/cloth_resets.npz --device cuda:0 --viz none
+  --poses_per_phase 4 --num_envs 8 --seed 42 \
+  --output logs/cloth_table_resets.npz --device cuda:0 --viz none
 
 # Independently restore and validate each row, then display it.
 uv run --no-sync python -m examples.tutorial.cloth_task.generator \
-  --view logs/cloth_resets.npz --device cuda:0 --viz viser
+  --view logs/cloth_table_resets.npz --device cuda:0 --viz viser
 
 # The same fresh-simulator replay checks without a viewer.
 uv run --no-sync python -m examples.tutorial.cloth_task.generator \
-  --view logs/cloth_resets.npz --device cuda:0 --viz none
+  --view logs/cloth_table_resets.npz --device cuda:0 --viz none
 
-# Optional allowance for the initial offline table-level IK pose.
+# Optional downward allowance during the physical table approach.
 uv run --no-sync python -m examples.tutorial.cloth_task.generator \
-  --poses_per_phase 16 --num_envs 8 --table_penetration 0.003 \
-  --output logs/cloth_resets.npz --device cuda:0 --viz none
+  --poses_per_phase 16 --num_envs 8 --partial_grasp_fraction 0.5 \
+  --table_penetration 0.003 \
+  --output logs/cloth_table_resets.npz --device cuda:0 --viz none
 ```
 
 `GeneratorCfg` at the top of `generator.py` owns the proposal ranges. The CLI
 exposes the seed, bank selection (`--phases reaching near_corner`, for example),
-quota, batch limit, settling duration, and replay duration. Increase the quota
-and environment count for a larger bank; `--max_batches` bounds rejection sampling.
+quota, supported-grasp fraction, batch limit, settling duration, and replay
+duration. Increase the quota and environment count for a larger bank; `--max_batches` bounds rejection sampling.
 Archive metadata records these settings, acceptance counts, solver configuration,
 material values, and simulation timestep. `resets.py` owns archive validation and
 restoration: all cloth vertices, named robot joints, drive targets, gripper command,
@@ -220,7 +236,7 @@ the **repository root**:
 uv run --no-sync python examples/tutorial/run.py train \
   --task Adapted_Cloth_Task --num_envs 64 --device cuda:0 \
   --max_iterations 800 --run_name cloth_diverse_resets \
-  env.events.reset_from_dataset.params.dataset_path="$PWD/logs/cloth_resets.npz"
+  env.events.reset_from_dataset.params.dataset_path="$PWD/logs/cloth_table_resets.npz"
 ```
 
 The archive is cached on the environment device once; each episode samples a row.
@@ -238,8 +254,9 @@ command; it must keep the gripper action negative to retain a grasped reset.
 Passing generation/replay checks establishes usable initial states, not that PPO
 has learned the complete task.
 
-The generator regression test covers producing all four banks and unassisted
-replay of the held banks at different environment origins:
+The generator regression test covers producing all four banks, requiring both
+supported and airborne grasped rows, and unassisted replay at different environment
+origins:
 
 ```bash
 uv run --no-sync --with pytest python -m pytest examples/tutorial/test_cloth_generator.py

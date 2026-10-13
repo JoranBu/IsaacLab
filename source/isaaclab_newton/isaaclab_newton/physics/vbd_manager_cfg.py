@@ -27,6 +27,12 @@ class VBDSolverCfg(NewtonSolverCfg):
     iterations: int = 10
     """Number of VBD iterations per substep."""
 
+    friction_epsilon: float = 1.0e-2
+    """Relative velocity threshold for smoothing rigid and particle friction [m/s].
+
+    Smaller values reduce slow sliding in nearly static contacts such as cloth pinches.
+    """
+
     integrate_with_external_rigid_solver: bool = False
     """Whether an external solver integrates rigid bodies."""
 

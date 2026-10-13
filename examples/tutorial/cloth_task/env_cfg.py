@@ -324,6 +324,8 @@ class PhysicsCfg(PresetCfg):
                     name="cloth",
                     solver_cfg=VBDSolverCfg(
                         iterations=20,
+                        # Reduce slow sliding through the pads under cloth load.
+                        friction_epsilon=1.0e-4,
                         rigid_body_particle_contact_buffer_size=1024,
                         particle_enable_self_contact=True,
                         particle_self_contact_radius=terms.CLOTH_PARTICLE_RADIUS,

@@ -12,16 +12,20 @@ From the repository root::
     uv run --no-sync python -m examples.tutorial.cloth_task.generator \
         --view logs/cloth_resets.npz --viz viser
 
-The generator constructs four independent reset regions, not demonstration
-trajectories. For grasp proposals it lifts the whole undeformed sheet flat
-by prescribing temporary flat nodal states while positioning/closing the robot.
-This bypasses the difficult exploration needed to pinch a flat sheet. It then
-releases EVERY vertex and validates the snapshot under normal table collision,
-gravity, and robot dynamics. No kinematic target or relaxed workspace is saved.
+The generator creates reaching, near-corner, table-supported grasp, airborne
+grasp, and near-goal snapshots within the task's four reset banks. Held states
+start with a free sheet on the table: the robot approaches with open jaws,
+closes around a small patch near the chosen corner, and lifts through normal
+policy actions. Contact may bunch several vertices or fold the corner.
 
-``--table_penetration`` only relaxes the generator's IK workspace during offline
-pose construction. It does not disable the table or change training physics.
-Interpenetrating proposals must survive the same unassisted validation checks.
+Only the initial flat placement and non-contact hover pose use direct state
+writes. Once the approach starts, no cloth or joint state is prescribed.
+Accepted snapshots must also survive reset and unassisted replay. The grasped
+bank reserves a quota for states with part of the sheet still on the table.
+
+``--table_penetration`` relaxes the generation controller's minimum Z goal,
+while keeping table collision enabled. Saved states must lie in the normal
+workspace and all cloth vertices remain dynamic during training and replay.
 """
 
 from __future__ import annotations
@@ -62,16 +66,24 @@ class GeneratorCfg:
     xy_jitter: float = 0.01
     yaw_jitter: float = 0.15
     near_corner_distance: tuple[float, float] = (0.012, 0.045)
-    # Above mat + particle radius + sheet diagonal: a corner-held sheet can
-    # hang along its full diagonal after the initially flat lift.
-    flat_lift_height: tuple[float, float] = (0.39, 0.42)
+    # Pinch about one mesh spacing inward: closing can fold a small corner
+    # patch into the jaws instead of requiring one perfectly centred vertex.
+    grasp_inset: tuple[float, float] = (0.030, 0.033)
+    pregrasp_height: tuple[float, float] = (0.0002, 0.0012)
+    hover_height: float = 0.06
+    approach_steps: int = 60
+    approach_settle_steps: int = 90
+    lift_speed: float = 0.03  # Vertical command speed [m/s].
+    max_lift_steps: int = 600
+    partial_lift_height: tuple[float, float] = (0.08, 0.14)
+    partial_grasp_fraction: float = 0.5
     table_penetration: float = 0.0
     ik_iterations: int = 160
     close_steps: int = 12
-    lift_steps: int = 12
-    settle_steps: int = 60  # Let the released flat sheet drape under gravity for 2 s.
-    validation_steps: int = 20  # 0.67 s at this task's 30 Hz control rate.
-    near_goal_clearance: tuple[float, float] = (0.075, 0.095)
+    settle_steps: int = 60  # Hold after pickup so the free sheet can settle.
+    validation_steps: int = 30  # 1 s at this task's 30 Hz control rate.
+    # Leave settling margin inside the accepted 75–100 mm near-goal region.
+    near_goal_clearance: tuple[float, float] = (0.082, 0.092)
     grasped_clearance: tuple[float, float] = (0.025, 0.055)
 
     def __post_init__(self):
@@ -80,7 +92,9 @@ class GeneratorCfg:
             "max_batches",
             "ik_iterations",
             "close_steps",
-            "lift_steps",
+            "approach_steps",
+            "approach_settle_steps",
+            "max_lift_steps",
             "settle_steps",
             "validation_steps",
         ):
@@ -88,11 +102,18 @@ class GeneratorCfg:
                 raise ValueError(f"{name} must be positive.")
         if not 0.0 <= self.table_penetration <= 0.01:
             raise ValueError("table_penetration must be between 0 and 0.01 m.")
-        for name in ("xy_jitter", "yaw_jitter"):
+        for name in ("xy_jitter", "yaw_jitter", "hover_height", "lift_speed"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
-        for name in ("near_corner_distance", "flat_lift_height", "grasped_clearance", "near_goal_clearance"):
+        for name in (
+            "near_corner_distance",
+            "grasp_inset",
+            "pregrasp_height",
+            "partial_lift_height",
+            "grasped_clearance",
+            "near_goal_clearance",
+        ):
             lower, upper = getattr(self, name)
             if not (math.isfinite(lower) and math.isfinite(upper) and 0.0 < lower < upper):
                 raise ValueError(f"{name} must contain two positive, finite, increasing distances.")
@@ -103,6 +124,10 @@ class GeneratorCfg:
             < terms.LIFT_TARGET_CLEARANCE
         ):
             raise ValueError("Grasped and near-goal clearances must be disjoint and below the success threshold.")
+        if self.hover_height <= 0.0 or self.lift_speed <= 0.0:
+            raise ValueError("hover_height and lift_speed must be positive.")
+        if not 0.0 <= self.partial_grasp_fraction <= 1.0:
+            raise ValueError("partial_grasp_fraction must be between zero and one.")
         if self.validation_steps < 10:
             raise ValueError("validation_steps must allow at least ten consecutive control steps.")
 
@@ -183,7 +208,7 @@ def _free_cloth(env: ManagerBasedEnv) -> None:
     Nodal kinematic targets have four fields: XYZ and a freedom flag. A flag
     of zero constrains that vertex to XYZ; one lets physics move it normally.
     Writing ones here clears any constraints without moving the vertices.
-    The flat construction itself prescribes positions rather than these flags.
+    No constraints are used during the table pickup.
     """
     positions = env.scene["cloth"].data.nodal_pos_w.torch
     targets = torch.cat((positions, torch.ones_like(positions[..., :1])), dim=-1)
@@ -191,8 +216,26 @@ def _free_cloth(env: ManagerBasedEnv) -> None:
     env.scene.write_data_to_sim()
 
 
-def _validate(env: ManagerBasedEnv, phase: int, steps: int) -> torch.Tensor:
-    """Replay-style proof under real physics; a supported sheet or a brief flying contact is not a stable grasp."""
+# Tolerance around vertex-centre height on the mat, including collision radius.
+_TABLE_TOLERANCE = 0.002
+_MIN_TABLE_FRACTION = 0.10
+
+
+def _table_fraction(env: ManagerBasedEnv) -> torch.Tensor:
+    """Fraction of vertices resting within 2 mm of the tabletop support height."""
+    nodes = env.scene["cloth"].data.nodal_pos_w.torch
+    clearance = nodes[..., 2] - env.scene.env_origins[:, None, 2]
+    clearance -= terms.MAT_TOP_HEIGHT + terms.CLOTH_PARTICLE_RADIUS
+    return (clearance.abs() <= _TABLE_TOLERANCE).float().mean(dim=-1)
+
+
+def _validate(env: ManagerBasedEnv, phase: int, steps: int, table_supported: bool | None = None) -> torch.Tensor:
+    """Prove a free-cloth reset under normal physics, including any requested table support.
+
+    With no explicit support requirement, a grasped row retains the support
+    classification it has at the start. This also verifies archived rows in the
+    viewer without adding a new phase or changing the reset archive schema.
+    """
     closed = phase >= 2
     valid = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     _free_cloth(env)
@@ -205,32 +248,74 @@ def _validate(env: ManagerBasedEnv, phase: int, steps: int) -> torch.Tensor:
     lower[2] = max(float(lower[2]), terms.MAT_TOP_HEIGHT)
     upper = position_b.new_tensor(env.cfg.actions.arm.workspace_upper)
     valid &= ((position_b >= lower) & (position_b <= upper)).all(dim=-1)
-    initial_corner = terms.cloth_grasp_point_w(env).clone()
+    supported = _table_fraction(env) >= _MIN_TABLE_FRACTION
+    if table_supported is not None:
+        supported.fill_(table_supported)
+    # Track a material point in the gripped patch. The outer corner itself
+    # may hang outside the jaws when several nearby vertices are bunched up.
+    nodes = env.scene["cloth"].data.nodal_pos_w.torch
+    closest = (nodes - terms.grasp_center_w(env)[:, None]).square().sum(dim=-1).argmin(dim=-1)
+    ids = torch.arange(env.num_envs, device=env.device)
+    initial_patch = nodes[ids, closest].clone()
     for step in range(steps):
-        pose = anchor
-        if closed:
-            # Hold the robot still; reject a freely falling or escaping corner.
-            drift = terms.cloth_grasp_point_w(env) - initial_corner
-            valid &= drift.norm(dim=-1) < 0.02
-        _hold(env, closed, 1, pose)
+        _hold(env, closed, 1, anchor)
         robot, cloth = env.scene["robot"], env.scene["cloth"]
         valid &= torch.isfinite(cloth.data.nodal_state_w.torch).all(dim=(1, 2))
         valid &= torch.isfinite(robot.data.joint_pos.torch).all(dim=-1)
         valid &= ~terms.unstable_robot(env) & ~terms.cloth_lost(env)
-        if closed and step >= steps // 2:
-            valid &= terms.bilateral_contact(env)
-            valid &= terms.cloth_height(env) > terms.MAT_TOP_HEIGHT + terms.GRASP_PROOF_LIFT
-        if not closed:
+        if closed:
+            point = cloth.data.nodal_pos_w.torch[ids, closest]
+            valid &= (point - initial_patch).norm(dim=-1) < 0.02
+            if step >= steps // 2:
+                _, _, pinched, patch_clearance = terms._pinch_state(env)
+                valid &= pinched & (patch_clearance > terms.GRASP_PROOF_LIFT)
+                if phase == 2:
+                    valid &= ~supported | (_table_fraction(env) >= _MIN_TABLE_FRACTION)
+        else:
             valid &= terms.cloth_clearance(env).abs() < 0.01
     clearance = terms.cloth_clearance(env)
     if phase == 2:
         valid &= (clearance > -0.002) & (clearance < 0.075)
+        valid &= supported | (clearance > _TABLE_TOLERANCE)
     elif phase == 3:
         valid &= (clearance >= 0.075) & (clearance < terms.LIFT_TARGET_CLEARANCE)
-    if phase == 1:
+    elif phase == 1:
         distance = (terms.cloth_grasp_point_w(env) - terms.grasp_center_w(env)).norm(dim=-1)
         valid &= (distance >= 0.008) & (distance <= 0.06)
     return valid
+
+
+def _move_pose(
+    env: ManagerBasedEnv, position: torch.Tensor, quaternion: torch.Tensor, closed: bool, steps: int
+) -> None:
+    """Interpolate a commanded pose through real simulation; never write joint or cloth state."""
+    start = _tcp_pose(env)[0].clone()
+    for step in range(steps):
+        goal = start + (position - start) * ((step + 1) / steps)
+        _hold(env, closed, 1, (goal, quaternion))
+
+
+def _lift_to_clearance(env: ManagerBasedEnv, desired: torch.Tensor, settings: GeneratorCfg) -> torch.Tensor:
+    """Raise a physically held sheet until its lowest vertex reaches the requested clearance."""
+    position, orientation = (value.clone() for value in _tcp_pose(env))
+    valid = terms.bilateral_contact(env)
+    stable = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    for _ in range(settings.max_lift_steps):
+        clearance = terms.cloth_clearance(env)
+        increment = (desired - clearance).clamp(-settings.lift_speed * env.step_dt, settings.lift_speed * env.step_dt)
+        position[:, 2] += torch.where(valid, increment, torch.zeros_like(increment))
+        # Stay inside normal commanded workspace even if an unsuccessful
+        # candidate loses its cloth or cannot reach the requested clearance.
+        position[:, 2] = torch.minimum(
+            position[:, 2], env.scene.env_origins[:, 2] + env.cfg.actions.arm.workspace_upper[2]
+        )
+        _hold(env, True, 1, (position, orientation))
+        valid &= terms.bilateral_contact(env) & ~terms.unstable_robot(env) & ~terms.cloth_lost(env)
+        at_goal = (terms.cloth_clearance(env) - desired).abs() < 0.002
+        stable = torch.where(valid & at_goal, stable + 1, torch.zeros_like(stable))
+        if ((stable >= 10) | ~valid).all():
+            break
+    return valid & (stable >= 10)
 
 
 def _flat_proposal(env: ManagerBasedEnv, settings: GeneratorCfg) -> tuple[torch.Tensor, torch.Tensor]:
@@ -251,11 +336,11 @@ def _flat_proposal(env: ManagerBasedEnv, settings: GeneratorCfg) -> tuple[torch.
     return state, quat_mul(rotation, down)
 
 
-def _construct(env: ManagerBasedEnv, settings: GeneratorCfg, phase: int) -> torch.Tensor:
+def _construct(env: ManagerBasedEnv, settings: GeneratorCfg, phase: int, table_supported: bool = False) -> torch.Tensor:
     """Construct one batched phase proposal, then let normal physics reject bad candidates."""
     _free_cloth(env)
     env.reset()
-    flat, down = _flat_proposal(env, settings)
+    _, down = _flat_proposal(env, settings)
     corner = terms.cloth_grasp_point_w(env).clone()
     if phase == 0:
         target = corner.clone()
@@ -270,60 +355,38 @@ def _construct(env: ManagerBasedEnv, settings: GeneratorCfg, phase: int) -> torc
         target[:, :2] += (torch.rand((env.num_envs, 2), device=env.device) - 0.5) * 0.012
         valid = _solve_pose(env, target, down, 0.04, settings.ik_iterations)
     else:
-        # Prescribe the full sheet's position only during construction. Normal
-        # physics takes over before any candidate is captured or validated.
-        cloth = env.scene["cloth"]
-        support = flat.clone()
-        target = corner.clone()
-        # The pad centres sit 2.6 mm above the downward-facing TCP.
-        # Centre the selected corner between them before closing the jaws.
-        target[:, 2] -= 0.003 + settings.table_penetration
-        valid = _solve_pose(env, target, down, 0.003, settings.ik_iterations)
-        heights = torch.empty(env.num_envs, device=env.device).uniform_(*settings.flat_lift_height)
-        start_z = target[:, 2].clone()
-        for step in range(1, settings.lift_steps + 1):
-            fraction = step / settings.lift_steps
-            position = target.clone()
-            position[:, 2] = start_z + fraction * (heights - start_z)
-            support[..., 2] = flat[..., 2] + fraction * (heights - start_z)[:, None]
-            cloth.write_nodal_state_to_sim_index(support)
-            _solve_pose(env, position, down, 0.003, max(16, settings.ik_iterations // settings.lift_steps))
-        # Close at the final flat height before releasing support, so the sheet
-        # cannot fall through an aperture that is still narrowing.
-        # Re-seed the final air pose from the collision-free home branch;
-        # near-table IK branches can fold the elbow into the robot when raised.
-        robot = env.scene["robot"]
-        robot.write_joint_position_to_sim_index(position=robot.data.default_joint_pos.torch)
-        robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(robot.data.default_joint_pos.torch))
-        env.sim.forward()
-        env.scene.update(env.physics_dt)
-        valid = _solve_pose(env, position, down, 0.003, settings.ik_iterations)
-        # Millimetre-scale IK residuals matter for a 6 mm particle between
-        # 4 mm jaws. Align the supported corner with the measured pad centre,
-        # preserving the flat sheet by translating every vertex equally.
-        supported_corner = corner.clone()
-        supported_corner[:, 2] += heights - start_z
-        support[..., :3] += (terms.grasp_center_w(env) - supported_corner)[:, None]
-        cloth.write_nodal_state_to_sim_index(support)
-        anchor = tuple(value.clone() for value in _tcp_pose(env))
-        for _ in range(settings.close_steps):
-            cloth.write_nodal_state_to_sim_index(support)
-            _hold(env, True, 1, anchor)
-        _free_cloth(env)
-        _hold(env, True, settings.settle_steps)
-        # Place the settled, deformed sheet in the phase's clearance region.
-        # Translate it by the measured robot displacement, including any IK
-        # residual, so repositioning does not tear the corner out of the jaws.
-        nodes = cloth.data.nodal_state_w.torch.clone()
-        lower, upper = settings.near_goal_clearance if phase == 3 else settings.grasped_clearance
-        desired = torch.empty(env.num_envs, device=env.device).uniform_(lower, upper)
+        # Only initialize a non-contact hover pose offline. From the first
+        # approach step onwards the mesh and robot advance entirely in physics.
+        inset = corner.new_zeros(corner.shape)
+        inset[:, :2].uniform_(*settings.grasp_inset)
+        inset[:, :2] *= -1.0
+        target = corner + quat_apply(down, inset)
+        target[:, 2] += torch.empty(env.num_envs, device=env.device).uniform_(*settings.pregrasp_height)
+        target[:, 2] -= settings.table_penetration
+        hover = target.clone()
+        hover[:, 2] += settings.hover_height
+        valid = _solve_pose(env, hover, down, 0.04, settings.ik_iterations)
+        _move_pose(env, target, down, False, settings.approach_steps)
+        # Let the actual hand catch up to the final downward goal before
+        # closing. Otherwise a visually near grasp can still miss the sheet.
+        _hold(env, False, settings.approach_settle_steps, (target, down))
+        _hold(env, True, settings.close_steps)
+        valid &= terms.bilateral_contact(env)
         position, orientation = (value.clone() for value in _tcp_pose(env))
-        target = position.clone()
-        target[:, 2] += desired - terms.cloth_clearance(env)
-        valid &= _solve_pose(env, target, orientation, 0.003, settings.ik_iterations)
-        nodes[..., :3] += (_tcp_pose(env)[0] - position)[:, None]
-        cloth.write_nodal_state_to_sim_index(nodes)
-    valid &= _validate(env, phase, settings.validation_steps)
+        position[:, 2] = env.scene.env_origins[:, 2] + torch.empty(env.num_envs, device=env.device).uniform_(
+            *settings.partial_lift_height
+        )
+        distance = (position - _tcp_pose(env)[0]).norm(dim=-1).amax().item()
+        steps = max(1, math.ceil(distance / (settings.lift_speed * env.step_dt)))
+        _move_pose(env, position, orientation, True, steps)
+        _hold(env, True, settings.settle_steps)
+        valid &= terms.bilateral_contact(env)
+        if not table_supported:
+            lower, upper = settings.near_goal_clearance if phase == 3 else settings.grasped_clearance
+            desired = torch.empty(env.num_envs, device=env.device).uniform_(lower, upper)
+            valid &= _lift_to_clearance(env, desired, settings)
+            _hold(env, True, settings.settle_steps)
+    valid &= _validate(env, phase, settings.validation_steps, table_supported if phase == 2 else None)
     return valid
 
 
@@ -336,42 +399,52 @@ def generate(
     env.reset(seed=settings.seed)
     records = []
     statistics = Counter()
+    jobs = []
     for phase in phases:
+        partial_quota = math.ceil(settings.poses_per_phase * settings.partial_grasp_fraction) if phase == 2 else 0
+        if partial_quota:
+            jobs.append((phase, True, partial_quota))
+        if partial_quota < settings.poses_per_phase:
+            jobs.append((phase, False, settings.poses_per_phase - partial_quota))
+    for phase, table_supported, quota in jobs:
+        name = PHASE_NAMES[phase]
+        region = f"{name}/{'table_supported' if table_supported else 'airborne'}" if phase == 2 else name
         accepted = 0
         for _ in range(settings.max_batches):
-            valid = _construct(env, settings, phase)
-            statistics[f"{PHASE_NAMES[phase]}/proposed"] += env.num_envs
-            statistics[f"{PHASE_NAMES[phase]}/constructed"] += int(valid.sum())
+            valid = _construct(env, settings, phase, table_supported)
+            statistics[f"{region}/proposed"] += env.num_envs
+            statistics[f"{region}/constructed"] += int(valid.sum())
             rows = valid.nonzero().flatten()
             if len(rows):
                 snapshot = capture_state(env, phase)
                 env.reset()
-                # Replaying the saved state also clears solver history. Validate
-                # again to reject states dependent on generator warm starts.
+                # Clear solver history, restore the exact candidate, and
+                # require its supported/airborne category to survive replay.
                 apply_states(env, snapshot, rows, rows)
                 env.scene.write_data_to_sim()
                 env.sim.forward()
                 env.scene.update(env.physics_dt)
-                replay_valid = _validate(env, phase, settings.validation_steps)
-                statistics[f"{PHASE_NAMES[phase]}/replayed"] += int(replay_valid[rows].sum())
-                rows = rows[replay_valid[rows]][: settings.poses_per_phase - accepted]
+                replay_valid = _validate(env, phase, settings.validation_steps, table_supported if phase == 2 else None)
+                statistics[f"{region}/replayed"] += int(replay_valid[rows].sum())
+                rows = rows[replay_valid[rows]][: quota - accepted]
                 if len(rows):
                     records.append({key: value[rows].cpu() for key, value in snapshot.items()})
                     accepted += len(rows)
-            statistics[f"{PHASE_NAMES[phase]}/accepted"] = accepted
+                    statistics[f"{name}/accepted"] += len(rows)
+            statistics[f"{region}/accepted"] = accepted
             print(
-                f"{PHASE_NAMES[phase]}: {accepted}/{settings.poses_per_phase} accepted; "
-                f"{statistics[f'{PHASE_NAMES[phase]}/proposed']} proposed, "
-                f"{statistics[f'{PHASE_NAMES[phase]}/constructed']} constructed, "
-                f"{statistics[f'{PHASE_NAMES[phase]}/replayed']} passed replay",
+                f"{region}: {accepted}/{quota} accepted; "
+                f"{statistics[f'{region}/proposed']} proposed, "
+                f"{statistics[f'{region}/constructed']} constructed, "
+                f"{statistics[f'{region}/replayed']} passed replay",
                 flush=True,
             )
-            if accepted >= settings.poses_per_phase:
+            if accepted >= quota:
                 break
-        if accepted < settings.poses_per_phase:
+        if accepted < quota:
             raise RuntimeError(
-                f"Could not fill {PHASE_NAMES[phase]} quota: {dict(statistics)}. "
-                "No dataset was replaced. Adjust proposal ranges/contact settings or increase max_batches."
+                f"Could not fill {region} quota: {dict(statistics)}. "
+                "No dataset was replaced. Adjust pickup ranges or increase max_batches."
             )
     return {key: torch.cat([record[key] for record in records]) for key in records[0]}, dict(statistics)
 
@@ -384,10 +457,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max_batches", type=int, default=64)
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--settle_steps", type=int, default=60, help="Unassisted flat-sheet settling steps.")
-    parser.add_argument("--validation_steps", type=int, default=20, help="Physics proof steps, repeated after reset.")
+    parser.add_argument("--settle_steps", type=int, default=60, help="Unassisted settling steps after pickup.")
+    parser.add_argument("--validation_steps", type=int, default=30, help="Physics proof steps, repeated after reset.")
     parser.add_argument(
-        "--table_penetration", type=float, default=0.0, help="Offline IK allowance [m], generation only."
+        "--table_penetration",
+        type=float,
+        default=0.0,
+        help="Downward approach allowance [m], generation only; table collisions remain enabled.",
+    )
+    parser.add_argument(
+        "--partial_grasp_fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of the grasped bank retaining table support (rounded up).",
     )
     parser.add_argument("--phases", nargs="+", choices=PHASE_NAMES, default=list(PHASE_NAMES))
     parser.add_argument("--view", type=Path, help="Replay this archive instead of generating.")
@@ -402,6 +484,7 @@ def main(argv: list[str] | None = None) -> int:
             table_penetration=args.table_penetration,
             settle_steps=args.settle_steps,
             validation_steps=args.validation_steps,
+            partial_grasp_fraction=args.partial_grasp_fraction,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -451,7 +534,7 @@ def main(argv: list[str] | None = None) -> int:
                         "physics": cfg.sim.physics.to_dict(),
                         "physics_dt": env.physics_dt,
                         "cloth_material": cfg.scene.cloth.spawn.physics_material.to_dict(),
-                        "support_removed_before_validation": True,
+                        "physical_table_pickup": True,
                     },
                 )
                 print(f"Saved {len(states['phase'])} states to {args.output.resolve()}", flush=True)
