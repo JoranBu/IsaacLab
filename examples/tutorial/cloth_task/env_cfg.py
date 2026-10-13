@@ -140,6 +140,10 @@ class FrankaSceneCfg(InteractiveSceneCfg):
         self.robot.spawn.variants["Physics"] = "mujoco"
         self.robot.spawn.variants["Colliders"] = "convex_hulls"
         self.robot.spawn.activate_contact_sensors = False
+        # The flat asset's 350 N/m finger drive lets a 6 mm thick cloth
+        # particle open the jaws until the pinch cannot support the sheet.
+        self.robot.actuators["panda_hand"].stiffness = 2000.0
+        self.robot.actuators["panda_hand"].damping = 100.0
         for properties in self.robot.spawn.articulation_props:
             if isinstance(properties, NewtonArticulationCfg):
                 properties.self_collision_enabled = True
@@ -320,6 +324,9 @@ class PhysicsCfg(PresetCfg):
                     name="cloth",
                     solver_cfg=VBDSolverCfg(
                         iterations=20,
+                        # The 1 cm/s default smoothing lets a loaded corner
+                        # creep out of the pads while the flat sheet drapes.
+                        friction_epsilon=1.0e-4,
                         rigid_body_particle_contact_buffer_size=1024,
                         particle_enable_self_contact=True,
                         particle_self_contact_radius=terms.CLOTH_PARTICLE_RADIUS,

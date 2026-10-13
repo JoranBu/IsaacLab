@@ -51,8 +51,8 @@ subset of environments preserves the other meshes and episode progress.
 `env_cfg.py` uses the coupled solver pattern from
 [`thesis/cloth_lift_proxy.py`](../../../thesis/cloth_lift_proxy.py): MJWarp
 advances the robot, VBD advances the cloth, and lagged robot collider proxies
-provide cloth–robot contact. Cloth forces are not fed back as robot loads in
-this proxy configuration. Cloth self-contact is enabled. The original mat
+provide cloth–robot contact with lagged impulse feedback to the robot. Cloth
+self-contact is enabled. The original mat
 supports the sheet, and its initial vertex height includes the 3 mm particle
 radius plus 1 mm of clearance.
 
@@ -73,6 +73,12 @@ overshoot. The cloth configuration lowers the minimum Z goal from 0.04 m to
 mat height and raises the target-offset cap from 2.0 to 4.0 rad/s: the scripted
 probe otherwise stopped above the sheet or descended too slowly for the
 20 s episode. Negative gripper input closes; zero or positive opens.
+
+The finger drive uses an explicit stiffness of 2,000 N/m and damping of
+100 Ns/m. Its 2 mm closed target leaves a nominal 4 mm aperture for the cloth’s
+6 mm particle collision thickness. VBD uses `friction_epsilon=1e-4` m/s to
+reduce slow sliding through the pads; the Newton default of `1e-2` m/s was too
+large for a sustained cloth pinch. These settings apply during training too.
 
 Tune cloth placement, mesh refinement, material parameters, and physics in
 `env_cfg.py`. Keep `CLOTH_PARTICLE_RADIUS` consistent with clearance geometry.
@@ -127,25 +133,114 @@ uv run --no-sync --with pytest python -m pytest examples/tutorial/test_vial_task
   actuators, mimic finger, and collider variants.
 - [Manager-based RL environment guide](../../../docs/source/how-to/create_manager_rl_env.rst).
 
-## Reset generator work in progress
+## OmniReset-inspired reset banks
 
-`generator.py` and `resets.py` preserve the interrupted OmniReset-inspired work.
-The proposed banks are reaching, near-corner, grasped, and near-goal. The generator
-constructs flat-lift proposals, pre-drapes the sheet, removes its assistance, and
-checks normal-physics replay before saving full nodal and robot states.
+[`generator.py`](generator.py) builds independent reset states for four regions,
+inspired by [OmniReset, section 3.2](https://arxiv.org/html/2603.15789v3#S3.SS2).
+This adapts its diverse-reset idea to this task's fixed cloth corner. The banks
+contain physical snapshots rather than demonstration trajectories.
 
-**Status:** grasped and near-goal banks have not passed replay validation; this
-is unfinished work, not a ready-to-use reset dataset. No valid complete archive
-has been produced. The cloth-specific contact stiffness/damping and 2 mm closed
-finger target in `env_cfg.py` are experimental adjustments from that work.
+| Bank | Initial situation |
+| --- | --- |
+| `reaching` | Open jaws, roughly 12–27 cm above the selected corner |
+| `near_corner` | Open jaws, 12–45 mm above the corner with small XY offsets |
+| `grasped` | Closed jaws holding the corner; whole-sheet clearance sampled at 25–55 mm |
+| `near_goal` | Closed jaws holding the corner; whole-sheet clearance sampled at 75–95 mm, below the 100 mm success threshold |
 
-The dataset reset event is disabled by default (`dataset_path=None`). The existing
-home-pose reset remains active. A working archive can later be enabled through
-`env.events.reset_from_dataset.params.dataset_path=/absolute/path/to/archive.npz`.
+Every proposal randomizes the flat sheet's XY position and yaw. The same material
+corner selected in `terms.py` remains the target. The saved clearance can differ
+slightly from its sampled value because the cloth continues settling.
 
-The script's options and generation-only table-penetration allowance are documented
-in its module docstring and `--help`:
+For the held banks, the script uses the policy's bounded IK controller to place
+the jaws around the corner, then lifts **all vertices flat** along a vertical path.
+During this construction it explicitly prescribes nodal positions; this is the
+only assistance. It aligns the supported corner with the measured pad centre,
+closes the jaws, and releases the entire sheet. Normal physics then drapes the
+cloth for two seconds. The settled robot and mesh are moved together into the
+bank's clearance region. IK, construction, settling, and validation are separate
+functions with comments in `generator.py`.
+
+Each candidate must pass 20 control steps (0.67 s) with free vertices, normal
+gravity, table collision, and ordinary pose-holding actions. Checks reject
+non-finite/lost states, unstable robot motion, slipping corners, lost pinches,
+and incorrect final clearance. The generator then resets the environment,
+restores the proposed snapshot, and repeats the proof. Only rows passing both
+checks are saved. The progress output distinguishes proposed, constructed, and
+replay-passing candidates. A failed quota leaves an existing archive intact.
+
+The generator uses `ManagerBasedEnv`, so success/failure rewards cannot reset a
+proposal midway through construction. Training continues to use the usual RL
+environment. `--table_penetration` permits up to 10 mm of extra downward IK reach
+**only during generation**; it neither removes table collision nor persists in
+snapshots. The default is zero. The final proof uses the normal workspace bounds.
+No vertex attachments, support flags, solver warm-start data, or reward milestones
+are saved. Real joint and nodal velocities are retained, so replay restores the
+physical state rather than silently turning a moving sheet into a static one.
+
+From the **repository root**:
 
 ```bash
-uv run --no-sync python -m examples.tutorial.cloth_task.generator --help
+# Small bank to inspect first: four accepted states per region.
+uv run --no-sync python -m examples.tutorial.cloth_task.generator \
+  --poses_per_phase 4 --num_envs 4 --seed 42 \
+  --output logs/cloth_resets.npz --device cuda:0 --viz none
+
+# Independently restore and validate each row, then display it.
+uv run --no-sync python -m examples.tutorial.cloth_task.generator \
+  --view logs/cloth_resets.npz --device cuda:0 --viz viser
+
+# The same fresh-simulator replay checks without a viewer.
+uv run --no-sync python -m examples.tutorial.cloth_task.generator \
+  --view logs/cloth_resets.npz --device cuda:0 --viz none
+
+# Optional allowance for the initial offline table-level IK pose.
+uv run --no-sync python -m examples.tutorial.cloth_task.generator \
+  --poses_per_phase 16 --num_envs 8 --table_penetration 0.003 \
+  --output logs/cloth_resets.npz --device cuda:0 --viz none
+```
+
+`GeneratorCfg` at the top of `generator.py` owns the proposal ranges. The CLI
+exposes the seed, bank selection (`--phases reaching near_corner`, for example),
+quota, batch limit, settling duration, and replay duration. Increase the quota
+and environment count for a larger bank; `--max_batches` bounds rejection sampling.
+Archive metadata records these settings, acceptance counts, solver configuration,
+material values, and simulation timestep. `resets.py` owns archive validation and
+restoration: all cloth vertices, named robot joints, drive targets, gripper command,
+and phase are stored in compressed `.npz` arrays. Positions are relative to each
+environment origin, so snapshots can be moved between vectorized environments.
+The loader rejects changed mesh geometry or incompatible robot joints. Regenerate
+when changing cloth refinement, placement, materials, robot, or physics.
+
+## Train with the reset bank
+
+The dataset event is disabled by default. Enable it with an absolute path, from
+the **repository root**:
+
+```bash
+uv run --no-sync python examples/tutorial/run.py train \
+  --task Adapted_Cloth_Task --num_envs 64 --device cuda:0 \
+  --max_iterations 800 --run_name cloth_diverse_resets \
+  env.events.reset_from_dataset.params.dataset_path="$PWD/logs/cloth_resets.npz"
+```
+
+The archive is cached on the environment device once; each episode samples a row.
+Equal bank quotas give equal bank probabilities with the default uniform row
+sampling. Optional explicit bank weights follow the table's order:
+
+```bash
+# Append this override to the training command for more near-corner resets:
+'env.events.reset_from_dataset.params.phase_weights=[0.2,0.4,0.2,0.2]'
+```
+
+A partial episode reset only restores the selected environments. Reward history
+starts fresh, including for already held cloth. The policy controls the next
+command; it must keep the gripper action negative to retain a grasped reset.
+Passing generation/replay checks establishes usable initial states, not that PPO
+has learned the complete task.
+
+The generator regression test covers producing all four banks and unassisted
+replay of the held banks at different environment origins:
+
+```bash
+uv run --no-sync --with pytest python -m pytest examples/tutorial/test_cloth_generator.py
 ```
