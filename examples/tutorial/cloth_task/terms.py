@@ -5,7 +5,7 @@
 
 # Adapted from isaac-sim/IsaacLabTutorial (Apache-2.0); see ../LICENSE-IsaacLabTutorial.
 
-"""Observations, rewards, milestones, and terminations for grasping and lifting a cloth."""
+"""Observations, rewards, and height-based success for lifting a cloth."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from isaaclab.managers import ManagerTermBase, ObservationTermCfg, RewardTermCfg
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, subtract_frame_transforms
 
 from .geometry import pinch_geometry
-from .progress import LiftProgress
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, DeformableObject
@@ -33,6 +32,7 @@ if TYPE_CHECKING:
 MAT_TOP_HEIGHT = 0.035
 CLOTH_PARTICLE_RADIUS = 0.003
 LIFT_TARGET_CLEARANCE = 0.10
+LIFT_HOLD_STEPS = 10
 GRASP_PROOF_LIFT = 0.006
 PINCH_DISTANCE = 0.015
 FIXED_FINGERTIP_OFFSET = (0.0, 0.0, 0.046)
@@ -42,11 +42,6 @@ MOVING_FINGERTIP_OFFSET = (0.0, 0.0, 0.046)
 def _finite(value: torch.Tensor) -> torch.Tensor:
     """Replace invalid terminal-state values with finite neutral values."""
     return torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _finite_error(value: torch.Tensor) -> torch.Tensor:
-    """Replace invalid geometric errors with a safely distant value."""
-    return torch.nan_to_num(value, nan=1.0e3, posinf=1.0e3, neginf=1.0e3)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -133,65 +128,59 @@ def _gripper_openness(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Milestones, success, and terminations
+# Success and terminations
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _history(env: ManagerBasedRLEnv) -> LiftProgress:
-    """Return the instance-owned episode progress buffer."""
-    progress = getattr(env, "_cloth_lift_progress", None)
-    if progress is None:
-        progress = LiftProgress(env.num_envs, env.device, stable_steps=10, grasp_steps=2)
-        env._cloth_lift_progress = progress
-    return progress
+def _hold_count(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Share the success counter with observations, including in the offline generator."""
+    count = getattr(env, "_cloth_hold_count", None)
+    if count is None:
+        count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        env._cloth_hold_count = count
+    return count
 
 
 class LiftHistoryTerm(ManagerTermBase):
-    """Latch physical milestones each step and terminate on a sustained lift.
+    """Count consecutive control steps above the height target and terminate on success.
 
-    Success requires a closed-jaw pinch estimate and every cloth vertex (including particle radius) at least
-    10 cm above the mat for ten consecutive control steps. Lifting only a corner cannot satisfy the goal.
+    Success requires every cloth vertex (including particle radius) at least 10 cm above the mat for ten
+    consecutive control steps. There is no pinch requirement or grasp/lift milestone state.
     """
 
     def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self.progress = _history(env)
+        self.hold_count = _hold_count(env)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        self.progress.reset(env_ids)
+        self.hold_count[slice(None) if env_ids is None else env_ids] = 0
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
         clearance = cloth_clearance(env)
-        _, _, pinched, patch_clearance = _pinch_state(env)
-        holding = pinched & (patch_clearance > GRASP_PROOF_LIFT)
-        above_target = clearance >= LIFT_TARGET_CLEARANCE
-        success = self.progress.update(holding, above_target, env.episode_length_buf)
+        finite = torch.isfinite(_cloth_positions(env)).all(dim=(1, 2))
+        finite &= torch.isfinite(env.scene["cloth"].data.nodal_vel_w.torch).all(dim=(1, 2))
+        above_target = finite & (clearance >= LIFT_TARGET_CLEARANCE)
+        self.hold_count.copy_(
+            torch.where(above_target, self.hold_count + 1, torch.zeros_like(self.hold_count)).clamp_max(LIFT_HOLD_STEPS)
+        )
+        success = self.hold_count >= LIFT_HOLD_STEPS
 
         log = env.extras.setdefault("log", {})
-        log["Metrics/grasp_rate"] = self.progress.grasped.float().mean()
-        log["Metrics/lift_rate"] = self.progress.lifted.float().mean()
         log["Metrics/success_rate"] = success.float().mean()
-        log["Diagnostics/cloth_height_m"] = _finite(cloth_height(env)).mean()
-        log["Diagnostics/gripper_openness"] = _gripper_openness(env).mean()
-        log["Diagnostics/cloth_clearance_m"] = _finite(clearance).mean()
-        completed = self.progress.time_to_success >= 0
-        if completed.any():
-            log["Metrics/time_to_success_s"] = self.progress.time_to_success[completed].float().mean() * env.step_dt
 
         return success
 
 
 def cloth_lost(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Terminate invalid cloth, a dropped completed lift, or a sheet whose centre is unreachable."""
+    """Terminate invalid cloth, vertices below the floor, or an unreachable sheet centre."""
     cloth: DeformableObject = env.scene["cloth"]
     positions = _cloth_positions(env)
     velocities = cloth.data.nodal_vel_w.torch
     root_pos_w, root_quat_w = _robot_root_pose(env)
     centre, _ = subtract_frame_transforms(root_pos_w, root_quat_w, positions.mean(dim=1))
     finite = torch.isfinite(positions).all(dim=(1, 2)) & torch.isfinite(velocities).all(dim=(1, 2))
-    dropped = _history(env).lifted & (cloth_clearance(env) < 0.002)
     below_floor = (positions[..., 2] - env.scene.env_origins[:, None, 2]).amin(dim=-1) < -0.05
-    return (~finite) | dropped | below_floor | (centre[:, 0].abs() > 0.62) | (centre[:, 1].abs() > 0.50)
+    return (~finite) | below_floor | (centre[:, 0].abs() > 0.62) | (centre[:, 1].abs() > 0.50)
 
 
 def unstable_robot(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -209,11 +198,12 @@ def unstable_robot(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 class ApproachProgressReward(ManagerTermBase):
-    """Pay the decrease in jaw-to-corner distance, in units of ``scale``, until a cloth pinch is confirmed.
+    """Pay signed jaw-to-corner distance progress throughout the episode, in units of ``scale``.
 
     Undiscounted distance changes telescope: retreating and returning to the same distance pays zero net reward.
     Do not clip individual increments; that makes a large retreat cheaper than several small approach steps.
     The first call after a reset initializes the reference distance without paying a reward.
+    Divide by control dt so the reward manager's dt scaling preserves the discrete distance increment.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
@@ -226,50 +216,48 @@ class ApproachProgressReward(ManagerTermBase):
         self._has_previous[ids] = False
 
     def __call__(self, env: ManagerBasedRLEnv, scale: float = 0.01) -> torch.Tensor:
-        distance = _finite_error(torch.linalg.vector_norm(grasp_center_w(env) - cloth_grasp_point_w(env), dim=-1))
+        distance = torch.linalg.vector_norm(grasp_center_w(env) - cloth_grasp_point_w(env), dim=-1)
+        valid = torch.isfinite(distance)
+        distance = _finite(distance)
         progress = (self._previous_distance - distance) / scale
-        active = self._has_previous & ~_history(env).grasped
+        reward = torch.where(self._has_previous & valid, progress, torch.zeros_like(progress)) / env.step_dt
         self._previous_distance.copy_(distance)
-        self._has_previous.fill_(True)
-        return torch.where(active, progress, torch.zeros_like(progress))
+        self._has_previous.copy_(valid)
+        return reward
 
 
 def lift_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Reward mean sheet clearance during a lifted pinch, providing credit before the entire sheet leaves the mat."""
-    mean_clearance = cloth_height(env) - MAT_TOP_HEIGHT - CLOTH_PARTICLE_RADIUS
-    fraction = (mean_clearance / LIFT_TARGET_CLEARANCE).clamp(0.0, 1.0)
-    _, _, pinched, patch_clearance = _pinch_state(env)
-    holding = pinched & (patch_clearance > GRASP_PROOF_LIFT)
-    return _finite(torch.where(holding, fraction, torch.zeros_like(fraction)))
+    """Reward mean sheet clearance, capped at the target, with no pinch or gripper-command requirement.
 
-
-class PhysicalMilestoneReward(ManagerTermBase):
-    """Pay each physical milestone (grasped, lifted) exactly once per episode.
-
-    A milestone latched in the current episode cannot pay again after losing and regaining the grasp.
+    This is a reward rate: the manager integrates it over control dt. Mean clearance supplies shaping while
+    some vertices remain on the table; success separately requires the lowest vertex to clear the target.
     """
-
-    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self._previous = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        ids = slice(None) if env_ids is None else env_ids
-        self._previous[ids] = False
-
-    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
-        history = _history(env)
-        current = torch.stack((history.grasped, history.lifted), dim=-1)
-        newly_reached = current & ~self._previous
-        weights = current.new_tensor((1.0, 2.0), dtype=torch.float32)
-        reward = (newly_reached.float() * weights).sum(dim=-1)
-        self._previous.copy_(current)
-        return _finite(reward)
+    mean_clearance = cloth_height(env) - MAT_TOP_HEIGHT - CLOTH_PARTICLE_RADIUS
+    return (_finite(mean_clearance) / LIFT_TARGET_CLEARANCE).clamp(0.0, 1.0)
 
 
 def success_bonus(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the one-step confirmed success signal."""
-    return _history(env).success.float()
+    """Pay on the actual success termination step, compensating the manager's dt scaling."""
+    return env.termination_manager.get_term("success").float() / env.step_dt
+
+
+def failure_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize lost cloth or an unstable robot once; timeouts and successful lifts are excluded."""
+    failed = env.termination_manager.get_term("cloth_lost") | env.termination_manager.get_term("unstable_robot")
+    return failed.float() / env.step_dt
+
+
+def action_rate_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the squared action change as a finite regularization rate."""
+    action = _finite(env.action_manager.action).clamp(-1.0, 1.0)
+    previous = _finite(env.action_manager.prev_action).clamp(-1.0, 1.0)
+    return (action - previous).square().sum(dim=-1)
+
+
+def joint_velocity_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return bounded squared joint speeds, keeping invalid terminal-state rewards finite."""
+    velocity = _finite(env.scene["robot"].data.joint_vel.torch).clamp(-12.0, 12.0)
+    return velocity.square().sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -277,19 +265,11 @@ def success_bonus(env: ManagerBasedRLEnv) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def progress_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the latched grasp and lift milestones that make the milestone reward Markov."""
-    history = _history(env)
-    return torch.stack((history.grasped, history.lifted), dim=-1).float()
-
-
 def lift_features(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return clearance, jaw opening, and normalized grasp/hold counters."""
-    history = _history(env)
-    grasp_fraction = (history.grasp_count.float() / history.grasp_steps).clamp(0.0, 1.0)
-    hold_fraction = (history.stable_count.float() / history.stable_steps).clamp(0.0, 1.0)
+    """Return clearance, jaw opening, and the normalized consecutive-height counter."""
+    hold_fraction = (_hold_count(env).float() / LIFT_HOLD_STEPS).clamp(0.0, 1.0)
     clearance = _finite(cloth_clearance(env)).clamp(-1.0, 1.0)
-    return torch.stack((clearance, _gripper_openness(env), grasp_fraction, hold_fraction), dim=-1)
+    return torch.stack((clearance, _gripper_openness(env), hold_fraction), dim=-1)
 
 
 def contact_state(env: ManagerBasedRLEnv) -> torch.Tensor:

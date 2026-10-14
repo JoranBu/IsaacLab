@@ -501,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg.seed = args.seed
     if not args.view:
         cfg.actions.arm.workspace_lower = (0.10, -0.35, terms.MAT_TOP_HEIGHT - settings.table_penetration)
+        # Only this process's config is changed. Keep higher user settings,
+        # but give physical table pickups the iteration budget validated here.
+        for entry in cfg.sim.physics.newton_mjwarp_vbd.solver_cfg.entries:
+            minimum = {"robot": 50, "cloth": 20}[entry.name]
+            entry.solver_cfg.iterations = max(entry.solver_cfg.iterations, minimum)
     with launch_simulation(cfg, args) as physics:
         cfg.sim.physics = physics
         env = ManagerBasedEnv(cfg)

@@ -11,37 +11,44 @@ or teleported by the gripper during simulation.
   outer corner (maximum X, minimum Y). The corner is selected from the default mesh and tracked
   as it deforms. Signed distance changes remain unclipped, so a closed distance
   cycle has zero net undiscounted approach reward.
-- **Grasp:** estimate a pinch when the same cloth vertex lies within 15 mm of
-  both fingertip pad centres and the gripper is commanded closed. The patch
-  must be more than 6 mm above the mat for two consecutive control steps to
-  latch the grasp milestone. This is a geometric proxy, not a measured force:
-  the coupled solver does not support the vial task's filtered contact sensors.
-- **Dense lift:** reward mean sheet clearance during a lifted pinch, capped at
-  the target height. This gives credit while part of the cloth still touches
-  the mat. Opening the gripper suppresses this reward immediately.
+- **Dense lift:** reward mean sheet clearance, capped at the target height.
+  This gives credit while part of the cloth still touches the mat and does not
+  depend on the pinch estimate or gripper command.
 - **Success:** the entire sheet's lowest vertex, minus particle radius, must
-  clear the mat by 0.10 m while the pinch persists for ten consecutive control
-  steps (about 0.33 s). Lifting only a corner does not complete the task.
+  clear the mat by 0.10 m for ten consecutive control steps (about 0.33 s),
+  regardless of the pinch estimate or gripper command. Falling below this
+  height restarts the count. Lifting only a corner does not complete the task.
 - **Failure:** non-finite nodal state, vertices falling below the floor,
-  unreachable sheet centre, or a return to the mat after the lift milestone.
-  Extreme robot joint motion and the 20 s timeout retain their vial-task roles.
+  unreachable sheet centre, or extreme/non-finite robot joint motion. Returning
+  to the mat is allowed so the policy can retry. Episodes time out after 10 s.
 
 `terms.py` owns the mat height, particle radius, grasp thresholds, lift goal,
 observations, rewards, and failure conditions. `geometry.py` owns the shared
-vertex-proximity calculation. `progress.py` retains episode-local counters
-and once-per-episode grasp/lift milestones, including partial resets.
+vertex-proximity calculation used by generator validation and privileged critic
+observations. There are no grasp/lift milestones or milestone rewards. The only
+success history is the consecutive-height counter owned by `LiftHistoryTerm`,
+which resets only for the selected environments.
+
+The reward manager multiplies every term by control dt. Approach progress,
+the success bonus, and failure penalty divide by dt to preserve discrete payouts:
+each centimetre of net approach pays 0.5, success pays 200, and failure costs 0.5.
+Lift shaping is a rate of up to 2 per simulated second. Action-change and joint
+velocity regularization are rates too; invalid terminal states keep rewards finite.
 
 ## Observations and resets
 
 The actor observes robot joint positions, velocities, targets, previous
 commands, hand pose/velocity, nine cloth material landmark positions and
 velocities in the robot base frame, the fingertip-to-corner vector, whole-sheet
-clearance, gripper opening, grasp/hold counters, and milestone flags. The
+clearance, gripper opening, and the consecutive-height counter. The
 critic also observes three jaw-proximity/pinch flags. The landmark indices
 are selected once from a 3 × 3 grid on the undeformed mesh; this compact state
 omits some deformation modes.
 
-The interface is **7 actions, 110 actor observations, 113 critic observations**.
+The interface is **7 actions, 107 actor observations, 110 critic observations**.
+Removing milestone flags and the grasp counter changes the input shape: start
+a fresh training run rather than resuming a checkpoint with the old observations.
+Existing reset archives remain compatible because they store physical states.
 `mdp.reset_scene_to_default` restores the cloth's default nodal positions and
 velocities alongside the robot home pose and actuator targets. Resetting a
 subset of environments preserves the other meshes and episode progress.
@@ -190,14 +197,14 @@ proposal during pickup. Training uses the usual RL environment.
 **only during generation**, while table collision stays enabled. The default is
 zero and the validated saved hand pose must be inside the normal workspace.
 No vertex attachments, constrained support flags, solver warm-start data, or
-reward milestones are saved. Actual joint and nodal velocities are retained.
+success counters are saved. Actual joint and nodal velocities are retained.
 
 From the **repository root**:
 
 ```bash
-# Four accepted states per bank; grasped includes two supported and two airborne.
+# 64 states total; grasped includes eight supported and eight airborne.
 uv run --no-sync python -m examples.tutorial.cloth_task.generator \
-  --poses_per_phase 4 --num_envs 8 --seed 42 \
+  --poses_per_phase 16 --num_envs 16 --seed 43 \
   --output logs/cloth_table_resets.npz --device cuda:0 --viz none
 
 # Independently restore and validate each row, then display it.
@@ -219,6 +226,10 @@ uv run --no-sync python -m examples.tutorial.cloth_task.generator \
 exposes the seed, bank selection (`--phases reaching near_corner`, for example),
 quota, supported-grasp fraction, batch limit, settling duration, and replay
 duration. Increase the quota and environment count for a larger bank; `--max_batches` bounds rejection sampling.
+For generation, the script locally raises VBD to at least 20 iterations and
+MJWarp to at least 50; higher configured values are retained. This changes only
+the generator's environment config, so training settings need no restoration.
+Archive viewing uses the current task settings to test replay under those settings.
 Archive metadata records these settings, acceptance counts, solver configuration,
 material values, and simulation timestep. `resets.py` owns archive validation and
 restoration: all cloth vertices, named robot joints, drive targets, gripper command,
@@ -251,6 +262,22 @@ benchmarks of the cloth task. Omitting it keeps the task configuration's default
 (currently uniform archive sampling). `uniform` also clears explicit phase
 weights; rows are equally likely, so larger banks are sampled more often.
 
+For explicit phase probabilities, use `--resets weighted` with four numbers in
+the order **reaching, near_corner, grasped, near_goal**:
+
+```bash
+uv run --no-sync python examples/tutorial/run.py train \
+  --task Adapted_Cloth_Task --resets weighted \
+  --reset_probabilities 0.1 0.4 0.3 0.2 \
+  --num_envs 64 --device cuda:0 --viz none
+```
+
+These values must be finite, nonnegative, and sum to one. A zero excludes that
+phase. Each selected phase samples uniformly from its own rows, so the requested
+phase probabilities do not depend on bank sizes. A phase with positive probability
+must have at least one archived state. The grasped probability covers both supported
+and airborne states in that bank.
+
 To use another bank, override
 `env.events.reset_from_dataset.params.dataset_path=/absolute/path/to/archive.npz`
 without `--resets`. An explicit `--resets` selection takes precedence over raw
@@ -261,11 +288,11 @@ Equal bank quotas give equal bank probabilities with the default uniform row
 sampling. Optional explicit bank weights follow the table's order:
 
 ```bash
-# Append this override to the training command for more near-corner resets:
+# Without --resets, this raw override also supports relative phase weights:
 'env.events.reset_from_dataset.params.phase_weights=[0.2,0.4,0.2,0.2]'
 ```
 
-A partial episode reset only restores the selected environments. Reward history
+A partial episode reset only restores the selected environments. Approach and success history
 starts fresh, including for already held cloth. The saved open/closed gripper command is restored after action history resets,
 so the first observation correctly identifies a held state. The policy controls
 the next command; it must keep the gripper action negative to retain that grasp.

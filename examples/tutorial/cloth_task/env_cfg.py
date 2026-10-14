@@ -242,8 +242,6 @@ class PolicyStateGroupCfg(ObsGroup):
     )
     cloth = ObsTerm(func=terms.ClothState)
     lift = ObsTerm(func=terms.lift_features)
-    # Latched milestones make the once-per-episode milestone rewards Markov.
-    progress = ObsTerm(func=terms.progress_flags)
 
     def __post_init__(self):
         self.enable_corruption = False
@@ -282,15 +280,14 @@ class DefaultEventsCfg:
 
 @configclass
 class RewardsCfg:
-    """Approach and lift shaping, grasp/lift milestones, success, and light regularization."""
+    """Approach and height shaping, terminal success/failure, and light regularization."""
 
-    approach_progress = RewTerm(func=terms.ApproachProgressReward, weight=1.0)
-    lift = RewTerm(func=terms.lift_reward, weight=0.1)
-    milestones = RewTerm(func=terms.PhysicalMilestoneReward, weight=10.0)
+    approach_progress = RewTerm(func=terms.ApproachProgressReward, weight=0.5)
+    lift = RewTerm(func=terms.lift_reward, weight=2)
     success = RewTerm(func=terms.success_bonus, weight=200.0)
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
-    joint_velocity = RewTerm(func=mdp.joint_vel_l2, weight=-0.0002)
-    cloth_lost = RewTerm(func=terms.cloth_lost, weight=-0.5)
+    action_rate = RewTerm(func=terms.action_rate_penalty, weight=-0.002)
+    joint_velocity = RewTerm(func=terms.joint_velocity_penalty, weight=-0.0002)
+    failure = RewTerm(func=terms.failure_penalty, weight=-0.5)
 
 
 @configclass
@@ -315,7 +312,7 @@ class PhysicsCfg(PresetCfg):
                         nconmax=200,
                         cone="elliptic",
                         impratio=10.0,
-                        iterations=100,
+                        iterations=50,  # used to be 100
                         ls_iterations=50,
                         use_mujoco_contacts=False,
                         ccd_iterations=35,
@@ -326,7 +323,7 @@ class PhysicsCfg(PresetCfg):
                 CouplerEntryCfg(
                     name="cloth",
                     solver_cfg=VBDSolverCfg(
-                        iterations=20,
+                        iterations=15,  # used to be 20
                         # Reduce slow sliding through the pads under cloth load.
                         friction_epsilon=1.0e-4,
                         rigid_body_particle_contact_buffer_size=1024,
@@ -369,7 +366,7 @@ class ClothEnvCFG(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         self.decimation = 4
-        self.episode_length_s = 20.0
+        self.episode_length_s = 10.0  # in seconds - used to be 20
         self.is_finite_horizon = False
         self.sim.dt = 1.0 / 120.0
         self.sim.render_interval = self.decimation

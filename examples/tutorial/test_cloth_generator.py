@@ -23,7 +23,10 @@ def test_generated_banks_survive_reset_and_relocation(tmp_path):
     cfg.events.reset_from_dataset.params["dataset_path"] = None
     cfg.scene.num_envs = 4
     cfg.seed = 42
-    # The offline generator uses the base environment so reward milestones
+    # Match the generator CLI's validated pickup budget; training may use fewer iterations.
+    cfg.sim.physics.newton_mjwarp_vbd.solver_cfg.entries[0].solver_cfg.iterations = 50
+    cfg.sim.physics.newton_mjwarp_vbd.solver_cfg.entries[1].solver_cfg.iterations = 20
+    # The offline generator uses the base environment so success/failure terms
     # cannot automatically reset a proposal during the physical pickup.
     with launch_simulation(cfg, {"visualizer": ["none"]}) as physics:
         cfg.sim.physics = physics

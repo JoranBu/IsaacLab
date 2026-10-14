@@ -150,8 +150,8 @@ class ResetFromDataset(ManagerTermBase):
     """Cache snapshots once, then sample rows on GPU during episode resets.
 
     The normal default reset runs first. With ``dataset_path=None`` this is a
-    no-op. Episode counters and latched rewards are reset by the usual managers;
-    sampled physical grasps do not pre-award milestones or mark an episode successful.
+    no-op. The consecutive-height counter is reset by the termination manager;
+    sampled physical grasps do not mark an episode successful.
     Restore the gripper command in the reset hook, after the action manager
     clears history, so the first observation describes the sampled grasp.
     """
@@ -199,7 +199,7 @@ class ResetFromDataset(ManagerTermBase):
 
         Physical drive targets were already restored in the reset event. Arm
         history remains zero because those commands are relative increments.
-        Episode milestones remain under the reward/termination managers.
+        The consecutive-height counter remains under the termination manager.
         """
         if self.states is None:
             return

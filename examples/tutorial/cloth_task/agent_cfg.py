@@ -42,7 +42,7 @@ class ClothStatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     seed = 42
     num_steps_per_env = 64
     max_iterations = 800
-    save_interval = 50
+    save_interval = 25  # anotherwise I always need to wait very long
     experiment_name = "cloth_franka_deformable_lift"
     run_name = ""
     obs_groups = {"actor": ["policy"], "critic": ["critic"]}
