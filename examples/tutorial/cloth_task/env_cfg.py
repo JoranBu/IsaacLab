@@ -280,11 +280,13 @@ class DefaultEventsCfg:
 
 @configclass
 class RewardsCfg:
-    """Approach and height shaping, terminal success/failure, and light regularization."""
+    """Approach and height shaping, elapsed-time cost, terminal rewards, and regularization."""
 
     approach_progress = RewTerm(func=terms.ApproachProgressReward, weight=0.5)
     lift = RewTerm(func=terms.lift_reward, weight=2)
     success = RewTerm(func=terms.success_bonus, weight=200.0)
+    # The manager integrates this rate: -0.02 per second until termination, including timeouts.
+    time_penalty = RewTerm(func=mdp.is_alive, weight=-0.02)
     action_rate = RewTerm(func=terms.action_rate_penalty, weight=-0.002)
     joint_velocity = RewTerm(func=terms.joint_velocity_penalty, weight=-0.0002)
     failure = RewTerm(func=terms.failure_penalty, weight=-0.5)

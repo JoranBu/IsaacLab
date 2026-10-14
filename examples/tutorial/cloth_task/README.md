@@ -18,6 +18,10 @@ or teleported by the gripper during simulation.
   clear the mat by 0.10 m for ten consecutive control steps (about 0.33 s),
   regardless of the pinch estimate or gripper command. Falling below this
   height restarts the count. Lifting only a corner does not complete the task.
+- **Time penalty:** subtract 0.02 per simulated second while the episode continues,
+  including the timeout step. Earlier success accumulates less cost; successful
+  and failed termination steps receive no additional time penalty. Tune
+  `RewardsCfg.time_penalty.weight`; set it to zero to disable it.
 - **Failure:** non-finite nodal state, vertices falling below the floor,
   unreachable sheet centre, or extreme/non-finite robot joint motion. Returning
   to the mat is allowed so the policy can retry. Episodes time out after 10 s.
@@ -34,6 +38,9 @@ the success bonus, and failure penalty divide by dt to preserve discrete payouts
 each centimetre of net approach pays 0.5, success pays 200, and failure costs 0.5.
 Lift shaping is a rate of up to 2 per simulated second. Action-change and joint
 velocity regularization are rates too; invalid terminal states keep rewards finite.
+The time penalty is also a rate, costing at most 0.2 over a 10-second episode.
+Changing rewards affects subsequent training, including resumed checkpoints;
+it does not change an existing policy's actions during playback.
 
 ## Observations and resets
 

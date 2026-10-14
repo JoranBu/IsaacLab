@@ -121,10 +121,16 @@ def test_cloth_lift_and_partial_reset(tmp_path):
                 assert not terms.success_bonus(env).any()
             reward.reset()
             baseline = env.reward_manager.compute(dt=env.step_dt).clone()
+            # Spending time without finishing reduces the actual reward at a rate of 0.02/s.
+            time_term = env.reward_manager.get_term_cfg("time_penalty")
+            time_term.weight = 0.0
+            without_time_cost = env.reward_manager.compute(dt=env.step_dt).clone()
+            time_term.weight = -0.02
+            torch.testing.assert_close(baseline - without_time_cost, baseline.new_full((2,), -0.02 * env.step_dt))
             assert update_success().all()
             terminal_reward = env.reward_manager.compute(dt=env.step_dt)
-            # Terminal payouts are discrete bonuses, not reward rates multiplied by dt.
-            torch.testing.assert_close(terminal_reward - baseline, baseline.new_full((2,), 200.0))
+            # Success pays the discrete bonus and stops charging elapsed time.
+            torch.testing.assert_close(terminal_reward - without_time_cost, baseline.new_full((2,), 200.0))
             assert not terms.failure_penalty(env).any()
 
             # Keep a closed-jaw snapshot to test reset observations later.
@@ -189,6 +195,7 @@ def test_cloth_lift_and_partial_reset(tmp_path):
             assert env.termination_manager.time_outs.all()
             assert not terms.failure_penalty(env).any()
             assert not terms.success_bonus(env).any()
+            torch.testing.assert_close(time_term.func(env), torch.ones(2, device=env.device))
             env.reset()
 
             # The reset archive must replay nodal geometry in the destination
