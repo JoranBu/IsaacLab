@@ -373,7 +373,7 @@ class ClothEnvCFG(ManagerBasedRLEnvCfg):
         self.sim.dt = 1.0 / 120.0
         self.sim.render_interval = self.decimation
         self.sim.physics = PhysicsCfg()
-        self.sim.default_visualizer_cfg = VisualizerCfg(eye=(0.64, 0.0, 0.36), lookat=(0.19, 0.02, 0.075))
+        self.sim.default_visualizer_cfg = VisualizerCfg(eye=(1.5, 0.0, 0.8), lookat=(-0.2, 0.02, 0.075))
 
     def play_mode(self):
         """Play complete episodes from the Franka home pose."""
