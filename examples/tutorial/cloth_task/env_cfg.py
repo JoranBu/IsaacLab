@@ -94,6 +94,20 @@ def _initialize_contacts(_event: PhysicsEvent) -> None:
         builder.shape_material_mu_rolling[shape_index] = _ROLLING_FRICTION
         builder.shape_material_mu_torsional[shape_index] = _TORSIONAL_FRICTION
 
+    # These coarse primitive approximations overlap at the trained home pose.
+    # Filter only this pair per robot; resolving it otherwise launches the arm
+    # into the unstable-robot termination before the policy can approach the cloth.
+    link1_boxes = {
+        label.rsplit("/panda_link1/", 1)[0]: index
+        for index, label in enumerate(builder.shape_label)
+        if label.endswith("/link1_box")
+    }
+    for index, label in enumerate(builder.shape_label):
+        if label.endswith("/link3_capsule"):
+            link1_box = link1_boxes.get(label.rsplit("/panda_link1/", 1)[0])
+            if link1_box is not None:
+                builder.add_shape_collision_filter_pair(link1_box, index)
+
     # Prototype builders register these attributes, but Newton's cloner does
     # not currently carry that registration to the main builder.
     newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
@@ -141,7 +155,8 @@ class FrankaSceneCfg(InteractiveSceneCfg):
     def __post_init__(self):
         # This task uses Newton/MJWarp; the shared asset defaults to the PhysX payload.
         self.robot.spawn.variants["Physics"] = "mujoco"
-        self.robot.spawn.variants["Colliders"] = "convex_hulls"
+        # Analytic boxes/capsules support full-surface cloth contact without mesh SDF generation.
+        self.robot.spawn.variants["Colliders"] = "primitives"
         self.robot.spawn.activate_contact_sensors = False
         # The flat asset's 350 N/m finger drive lets a 6 mm thick cloth
         # particle open the jaws until the pinch cannot support the sheet.
@@ -343,7 +358,9 @@ class PhysicsCfg(PresetCfg):
                     bodies=[r"/World/envs/env_[^/]+/Robot"],
                     mode="lagged",
                     collide_interval=1,
-                    collision_pipeline=NewtonCollisionPipelineCfg(),
+                    collision_pipeline=NewtonCollisionPipelineCfg(
+                        enable_rigid_soft_full_surface_contact=True,
+                    ),
                 ),
             ],
             iterations=1,
